@@ -1,0 +1,47 @@
+# Keil MDK
+*.uvguix.*
+*.uvoptx
+*.bak
+*.dep
+*.o
+*.d
+*.crf
+*.iex
+*.sct
+*.lnp
+*.htm
+*.lst
+*.map
+*.axf
+*.hex
+*.bin
+*.lib
+*.lnp
+*.build_log.htm
+*.uvguix
+*.Scatter
+*.JLinkDebug*
+*.JLinkSettings*
+*.Administrator*
+*.uvmpw
+
+# Build output
+MDK-ARM/JY_EnvMon/
+MDK-ARM/Listings/
+MDK-ARM/Objects/
+DebugConfig/
+
+# CubeMX
+*.ioc
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Backup directories
+backup-*/
