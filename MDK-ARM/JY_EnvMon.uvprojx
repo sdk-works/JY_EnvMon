@@ -443,6 +443,11 @@
               <FileType>1</FileType>
               <FilePath>../App/dtu.c</FilePath>
             </File>
+            <File>
+              <FileName>flash_store.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/flash_store.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -522,6 +527,11 @@
               <FileName>stm32f4xx_hal.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal.c</FilePath>
+            </File>
+            <File>
+              <FileName>stm32f4xx_hal_iwdg.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_iwdg.c</FilePath>
             </File>
             <File>
               <FileName>stm32f4xx_hal_exti.c</FileName>
