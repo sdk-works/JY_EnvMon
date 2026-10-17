@@ -70,7 +70,7 @@ static int Dtu_PutValue(char *buf, size_t pos, size_t maxlen,
 /* 组上行遥测 JSON（契约 §3 格式）到 buf；返回长度。rec 是待发送记录 */
 static uint16_t Dtu_BuildTelemetry(const FS_Record_t *rec, char *buf, uint16_t maxlen)
 {
-    char  dev[8];
+    char  dev[48];   /* "device_id/boot_id/seq"，需容纳最长数字，dev[8] 会截断 msg_id */
     snprintf(dev, sizeof(dev), "%s/%lu/%lu", DTU_DEVICE_ID,
              (unsigned long)rec->boot_id, (unsigned long)rec->seq);
 
@@ -133,7 +133,8 @@ static uint16_t Dtu_BuildTelemetry(const FS_Record_t *rec, char *buf, uint16_t m
 /* 通过 USART1 发送一帧（阻塞发完） */
 static void Dtu_Send(const uint8_t *data, uint16_t len)
 {
-    HAL_UART_Transmit(&huart1, (uint8_t*)data, len, 200);
+    /* 9600bps 下 512B 需 ~533ms，200ms 会中途超时截断报文；放宽到 1000ms 覆盖整帧 */
+    HAL_UART_Transmit(&huart1, (uint8_t*)data, len, 1000);
 }
 
 /* 发送一条记录；返回是否成功（仅指串口发出，不代表云端入库） */
