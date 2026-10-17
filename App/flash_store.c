@@ -57,6 +57,13 @@ static uint32_t s_dropped = 0;
 static uint32_t s_act_data_addr = 0;   /* 当前活动数据扇区基址 */
 static uint32_t s_act_data_gen = 0;
 
+/* 当前活动扇区已占用的槽位数（RAM 维护）。
+   注意：不能把计数值递增写回 Flash 的 hdr.used ——
+   Flash 编程只能把 1 写成 0，"已用 1 条"再写"已用 2 条"会变成
+   0x01 & 0x02 = 0x00，计数归零后新记录会覆盖已有记录（丢数据）。
+   hdr.used 仅在整扇区迁移时写入一次（目标扇区刚擦除，可写任意值）。 */
+static uint32_t s_used = 0;
+
 /* RAM 队列：待发/未确认记录索引（内存工作副本，Flash 为持久层）。
    数据存 Flash，RAM 只存索引(槽号+boot_id+seq+确认标志)，避免128KB数组超RAM。 */
 #define FS_RAM_CAP  FLASH_STORE_CAP_PER_SECTOR
@@ -161,6 +168,22 @@ static void FS_ReadDataHdr(uint32_t base, FS_DataHdr_t *hdr)
     memcpy(hdr, (void*)base, sizeof(*hdr));
 }
 
+/* 扫描扇区已用槽位数：从扇区头之后逐条检查，遇到全 0xFF 的空槽即停止。
+   记录是顺序写入的，因此第一个空槽之前都是有效槽位。 */
+static uint32_t FS_ScanUsed(uint32_t base)
+{
+    for (uint32_t i = 0; i < FLASH_STORE_CAP_PER_SECTOR; i++) {
+        const uint8_t *p = (const uint8_t *)(base + FLASH_STORE_SECTOR_HDR
+                                             + i * FLASH_STORE_REC_SIZE);
+        int blank = 1;
+        for (uint32_t k = 0; k < FLASH_STORE_REC_SIZE; k++) {
+            if (p[k] != 0xFF) { blank = 0; break; }
+        }
+        if (blank) return i;
+    }
+    return FLASH_STORE_CAP_PER_SECTOR;
+}
+
 /* 从指定数据扇区恢复 RAM 队列索引（只载入未确认记录） */
 static uint32_t FS_LoadDataSector(uint32_t base, uint32_t used)
 {
@@ -179,8 +202,10 @@ static uint32_t FS_LoadDataSector(uint32_t base, uint32_t used)
     return s_q_count;
 }
 
-/* 把未确认记录从源(活动)扇区复制到目标扇区并更新头（迁移用） */
-static uint32_t FS_CopyPendingTo(uint32_t target_base, uint32_t new_gen)
+/* 把未确认记录从源(活动)扇区复制到目标扇区并更新头（迁移用）。
+   契约 §10.5：必须逐条 CRC 校验 + 总数核对 + 迁移完成标识，缺一不可。
+   返回实际复制条数；任何一条失败或总数不符返回 -1（调用方据此保留旧扇区）。 */
+static int32_t FS_CopyPendingTo(uint32_t target_base, uint32_t new_gen)
 {
     /* 先擦目标扇区 */
     uint32_t target_sector = (target_base == FS_SECTOR5_ADDR) ? FLASH_STORE_SECTOR_DATA_A
@@ -192,25 +217,38 @@ static uint32_t FS_CopyPendingTo(uint32_t target_base, uint32_t new_gen)
     hdr.generation = new_gen;
     hdr.committed = 0xFFFFFFFF;   /* 未完成 */
     hdr.used = s_q_count;
-    /* 写头（4 word） */
     FS_ProgWord(target_base + 0,  hdr.magic);
     FS_ProgWord(target_base + 4,  hdr.generation);
     FS_ProgWord(target_base + 8,  hdr.committed);
     FS_ProgWord(target_base + 12, hdr.used);
-    /* 从源扇区读每条未确认记录，写到目标 */
+
+    /* 逐条复制：任一条 CRC/提交标识校验失败即整体失败（不留下残缺扇区） */
+    uint32_t copied = 0;
     for (uint32_t i = 0; i < s_q_count; i++) {
         uint32_t src_addr = s_act_data_addr + FLASH_STORE_SECTOR_HDR
                           + s_queue[i].slot * FLASH_STORE_REC_SIZE;
         FS_Record_t rec;
-        if (FS_UnpackRecord((const uint8_t*)src_addr, &rec) == 0) {
-            FS_WriteRecordToFlash(target_base + FLASH_STORE_SECTOR_HDR + i * FLASH_STORE_REC_SIZE,
-                                  &rec);
+        if (FS_UnpackRecord((const uint8_t*)src_addr, &rec) != 0) {
+            return -1;                      /* 源记录损坏，整体放弃迁移 */
         }
-        s_queue[i].slot = i;   /* 复制到目标后槽号重排 */
+        uint32_t dst_addr = target_base + FLASH_STORE_SECTOR_HDR + i * FLASH_STORE_REC_SIZE;
+        FS_WriteRecordToFlash(dst_addr, &rec);
+        /* 回读校验：目标记录必须可解包，否则视为写入失败 */
+        FS_Record_t chk;
+        if (FS_UnpackRecord((const uint8_t*)dst_addr, &chk) != 0) {
+            return -1;
+        }
+        copied++;
     }
-    /* 置提交完成 */
+
+    /* 总数核对：契约要求"逐条 CRC + 总数"，缺一不可 */
+    if (copied != s_q_count) return -1;
+
+    /* 提交完成标识（最后写） */
     FS_ProgWord(target_base + 8, 0);
-    return s_q_count;
+    if (*(volatile uint32_t *)(target_base + 8) != 0) return -1;
+
+    return (int32_t)copied;
 }
 
 /* 读取持久 boot_id：两元数据扇区所有槽中，取 CRC 有效且 boot_id 最大的。
@@ -299,10 +337,11 @@ void FS_Init(void)
     }
     s_generation = s_act_data_gen;
 
+    /* 以扫描结果为准确定已用槽位数（不信任 hdr.used 的递增写入） */
+    s_used = FS_ScanUsed(s_act_data_addr);
+
     /* 载入待发记录 */
-    FS_DataHdr_t act;
-    FS_ReadDataHdr(s_act_data_addr, &act);
-    FS_LoadDataSector(s_act_data_addr, (act.magic==FS_MAGIC)? act.used : 0);
+    FS_LoadDataSector(s_act_data_addr, s_used);
 }
 
 uint32_t FS_GetBootId(void) { return s_boot_id; }
@@ -330,26 +369,23 @@ uint32_t FS_NextBootId(void)
 FS_Err_t FS_Append(const FS_Record_t *rec)
 {
     if (s_q_count >= FS_RAM_CAP) {
-        /* 队列满：丢弃最旧未确认记录 */
+        /* 队列满：丢弃最旧未确认记录并计数（契约 §10.7） */
         s_dropped++;
-        /* 移除队首（内存索引） */
         memmove(&s_queue[0], &s_queue[1], (s_q_count-1)*sizeof(FS_SlotIdx_t));
         s_q_count--;
-        FS_Recycle();
+        if (FS_Recycle() != FS_OK) {
+            return FS_ERR_FULL;     /* 回收失败：旧扇区仍完整，本次不写入 */
+        }
     }
-    /* 判断活动扇区是否写满：used 达到容量 */
-    FS_DataHdr_t act;
-    FS_ReadDataHdr(s_act_data_addr, &act);
-    if (act.magic != FS_MAGIC || act.used >= FLASH_STORE_CAP_PER_SECTOR) {
+    /* 判断活动扇区是否写满（用 RAM 维护的 s_used，不读/写 hdr.used） */
+    if (s_used >= FLASH_STORE_CAP_PER_SECTOR) {
         FS_Err_t r = FS_Recycle();
         if (r != FS_OK) return r;
     }
-    /* 追加到活动扇区 */
-    FS_DataHdr_t h2;
-    FS_ReadDataHdr(s_act_data_addr, &h2);
-    uint32_t slot = h2.used;
+    /* 追加到活动扇区：槽位由 s_used 决定，不再递增写回 Flash */
+    uint32_t slot = s_used;
     FS_WriteRecordToFlash(s_act_data_addr + FLASH_STORE_SECTOR_HDR + slot*FLASH_STORE_REC_SIZE, rec);
-    FS_ProgWord(s_act_data_addr + 12, slot + 1);   /* used+1 */
+    s_used = slot + 1;
     s_queue[s_q_count].slot     = slot;
     s_queue[s_q_count].boot_id  = rec->boot_id;
     s_queue[s_q_count].seq      = rec->seq;
@@ -397,6 +433,17 @@ bool FS_Peek(FS_Record_t *rec, bool peek)
     return true;
 }
 
+bool FS_PeekLatest(FS_Record_t *rec)
+{
+    if (s_q_count == 0) return false;
+    uint32_t addr = s_act_data_addr + FLASH_STORE_SECTOR_HDR
+                  + s_queue[s_q_count - 1].slot * FLASH_STORE_REC_SIZE;
+    if (FS_UnpackRecord((const uint8_t*)addr, rec) != 0) {
+        return false;               /* 队尾损坏：不移除，等回收时处理 */
+    }
+    return true;
+}
+
 uint32_t FS_PendingCount(void) { return s_q_count; }
 uint32_t FS_DroppedCount(void) { return s_dropped; }
 
@@ -406,8 +453,19 @@ FS_Err_t FS_Recycle(void)
     uint32_t target = (s_act_data_addr == FS_SECTOR5_ADDR) ? FS_SECTOR6_ADDR
                                                            : FS_SECTOR5_ADDR;
     uint32_t new_gen = s_act_data_gen + 1;
-    /* 复制保留数据到目标 */
-    FS_CopyPendingTo(target, new_gen);
+
+    /* 复制保留数据到目标；失败则保留旧扇区不动（契约 §10.5：先复制校验，再擦旧） */
+    int32_t copied = FS_CopyPendingTo(target, new_gen);
+    if (copied < 0) {
+        return FS_ERR_CRC;          /* 旧扇区仍完整，下次可重试 */
+    }
+
+    /* 复制成功后才重排槽号；新扇区占用槽位数 = 保留条数 */
+    for (uint32_t i = 0; i < s_q_count; i++) {
+        s_queue[i].slot = i;
+    }
+    s_used = (uint32_t)copied;
+
     /* 擦旧扇区 */
     uint32_t old_sector = (s_act_data_addr == FS_SECTOR5_ADDR) ? FLASH_STORE_SECTOR_DATA_A
                                                                : FLASH_STORE_SECTOR_DATA_B;

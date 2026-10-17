@@ -51,6 +51,22 @@ static uint32_t     s_boot_id = 0;
 
 /* ====== 内部函数 ====== */
 
+/* 按 valid 位图输出一个数值：有效则输出格式化数值，无效输出 null（契约 §3.3）。
+   禁止把无效量输出为 0 —— 0 是合法读数（夜间光照、CO2 为 0）。 */
+static int Dtu_PutValue(char *buf, size_t pos, size_t maxlen,
+                        int valid, const char *fmt, double value)
+{
+    if (!valid) {
+        const char *null_str = "null";
+        size_t l = strlen(null_str);
+        if (pos + l >= maxlen) return -1;
+        memcpy(&buf[pos], null_str, l);
+        return (int)l;
+    }
+    int n = snprintf(&buf[pos], maxlen - pos, fmt, value);
+    return (n < 0) ? -1 : n;
+}
+
 /* 组上行遥测 JSON（契约 §3 格式）到 buf；返回长度。rec 是待发送记录 */
 static uint16_t Dtu_BuildTelemetry(const FS_Record_t *rec, char *buf, uint16_t maxlen)
 {
@@ -58,40 +74,60 @@ static uint16_t Dtu_BuildTelemetry(const FS_Record_t *rec, char *buf, uint16_t m
     snprintf(dev, sizeof(dev), "%s/%lu/%lu", DTU_DEVICE_ID,
              (unsigned long)rec->boot_id, (unsigned long)rec->seq);
 
-    /* 定点还原（契约 §10.6）：÷倍率 */
-    float temperature = rec->data[FS_CH_TEMPERATURE]  / 10.0f;
-    float humidity    = rec->data[FS_CH_HUMIDITY]     / 10.0f;
-    float co2         = (float)rec->data[FS_CH_CO2];
-    float light       = (float)rec->data[FS_CH_LIGHT];
-    float pressure    = rec->data[FS_CH_PRESSURE]     / 10.0f;
-    float soil_temp   = rec->data[FS_CH_SOIL_TEMP]    / 10.0f;
-    float soil_moist  = rec->data[FS_CH_SOIL_MOISTURE]/ 10.0f;
-    float soil_ec     = (float)rec->data[FS_CH_SOIL_EC];
-
-    /* valid 数组 */
-    int v[8];
+    /* valid 位图 */
+    int v[FS_CH_NUM];
     for (int i = 0; i < FS_CH_NUM; i++)
         v[i] = (rec->valid >> i) & 1;
 
+    /* 定点还原（契约 §10.6）：÷倍率。
+       光照按 uint32 无符号还原，不走 float 中转（避免 >2^24 丢精度/溢出）。 */
+    uint32_t light_u32 = (uint32_t)rec->data[FS_CH_LIGHT];
+
+    size_t pos = 0;
     int n = snprintf(buf, maxlen,
         "{\"type\":\"telemetry\",\"schema_version\":1,\"device_id\":\"%s\","
         "\"msg_id\":\"%s\",\"boot_id\":%lu,\"seq\":%lu,"
         "\"sampled_at\":%lu,\"time_quality\":%d,\"uptime_ms\":%llu,"
-        "\"data\":{"
-        "\"temperature\":%.1f,\"humidity\":%.1f,\"co2\":%.0f,"
-        "\"light\":%.0f,\"pressure\":%.1f,"
-        "\"soil_temperature\":%.1f,\"soil_moisture\":%.1f,\"soil_ec\":%.0f,"
-        "\"valid\":[%d,%d,%d,%d,%d,%d,%d,%d]}}\n",
+        "\"data\":{",
         DTU_DEVICE_ID, dev,
         (unsigned long)rec->boot_id, (unsigned long)rec->seq,
         (unsigned long)rec->sampled_at, (int)rec->time_quality,
-        (unsigned long long)rec->uptime_ms,
-        (double)temperature, (double)humidity, (double)co2,
-        (double)light, (double)pressure,
-        (double)soil_temp, (double)soil_moist, (double)soil_ec,
+        (unsigned long long)rec->uptime_ms);
+    if (n < 0 || (size_t)n >= maxlen) return (uint16_t)(maxlen - 1);
+    pos = (size_t)n;
+
+    /* 每个通道：有效输出数值，无效输出 null */
+    struct { const char *key; int valid; const char *fmt; double val; } fields[] = {
+        { "\"temperature\":",     v[FS_CH_TEMPERATURE],    "%.1f", (double)((int32_t)rec->data[FS_CH_TEMPERATURE])    / 10.0 },
+        { "\"humidity\":",        v[FS_CH_HUMIDITY],       "%.1f", (double)((int32_t)rec->data[FS_CH_HUMIDITY])       / 10.0 },
+        { "\"co2\":",             v[FS_CH_CO2],            "%.0f", (double)((int32_t)rec->data[FS_CH_CO2]) },
+        { "\"light\":",           v[FS_CH_LIGHT],          "%.0f", (double)light_u32 },
+        { "\"pressure\":",        v[FS_CH_PRESSURE],       "%.1f", (double)((int32_t)rec->data[FS_CH_PRESSURE])       / 10.0 },
+        { "\"soil_temperature\":",v[FS_CH_SOIL_TEMP],      "%.1f", (double)((int32_t)rec->data[FS_CH_SOIL_TEMP])      / 10.0 },
+        { "\"soil_moisture\":",   v[FS_CH_SOIL_MOISTURE],  "%.1f", (double)((int32_t)rec->data[FS_CH_SOIL_MOISTURE])  / 10.0 },
+        { "\"soil_ec\":",         v[FS_CH_SOIL_EC],        "%.0f", (double)((int32_t)rec->data[FS_CH_SOIL_EC]) },
+    };
+
+    for (size_t i = 0; i < sizeof(fields)/sizeof(fields[0]); i++) {
+        size_t kl = strlen(fields[i].key);
+        if (pos + kl >= maxlen) return (uint16_t)(maxlen - 1);
+        memcpy(&buf[pos], fields[i].key, kl);
+        pos += kl;
+        int w = Dtu_PutValue(buf, pos, maxlen, fields[i].valid, fields[i].fmt, fields[i].val);
+        if (w < 0) return (uint16_t)(maxlen - 1);
+        pos += (size_t)w;
+        if (pos + 1 >= maxlen) return (uint16_t)(maxlen - 1);
+        buf[pos++] = ',';
+    }
+
+    n = snprintf(&buf[pos], maxlen - pos,
+        "\"valid\":[%d,%d,%d,%d,%d,%d,%d,%d]}}\n",
         v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7]);
-    if (n < 0 || n >= maxlen) n = maxlen - 1;
-    return (uint16_t)n;
+    if (n < 0) return (uint16_t)(maxlen - 1);
+    pos += (size_t)n;
+    if (pos >= maxlen) pos = maxlen - 1;
+    buf[pos] = '\0';
+    return (uint16_t)pos;
 }
 
 /* 通过 USART1 发送一帧（阻塞发完） */
@@ -192,7 +228,8 @@ static void Dtu_MaybeNewRecord(void)
         rec.data[FS_CH_TEMPERATURE]    = FS_FIXED_DIV10(g_env.air_temp);
         rec.data[FS_CH_HUMIDITY]       = FS_FIXED_DIV10(g_env.air_humi);
         rec.data[FS_CH_CO2]            = FS_FIXED_DIV1(g_env.co2);
-        rec.data[FS_CH_LIGHT]          = FS_FIXED_DIV1(g_env.lux);
+        /* 光照：g_env.lux 已是 uint32，直接无符号落库，不走 int32/float 中转 */
+        rec.data[FS_CH_LIGHT]          = FS_FIXED_UINT1(g_env.lux);
         rec.data[FS_CH_PRESSURE]       = FS_FIXED_DIV10(g_env.pressure);
         rec.data[FS_CH_SOIL_TEMP]      = FS_FIXED_DIV10(g_env.soil_temp);
         rec.data[FS_CH_SOIL_MOISTURE]  = FS_FIXED_DIV10(g_env.soil_humi);
@@ -204,9 +241,10 @@ static void Dtu_MaybeNewRecord(void)
         if (g_env.soil_valid)    valid |= 0xE0;   /* bit5-7: soil_temp,soil_moist,soil_ec */
         rec.valid = valid;
 
-        /* seq 分配：用当前队列长度推断下一个 seq（简化：boot内从1递增，存到rec前设值） */
-        /* 通过 flash_store 内部维护；这里 seq 字段用于 msg_id，先给个占位，实际由FS记录 */
-        FS_Append(&rec);
+        /* 写入失败（队列满且回收失败）时不递增 seq，避免编号空洞 */
+        if (FS_Append(&rec) != FS_OK) {
+            s_seq--;
+        }
     }
 }
 
@@ -221,11 +259,21 @@ static void Dtu_RunStateMachine(void)
         if (FS_PendingCount() > 0) {
             if (now - s_last_send_ms >= DTU_SEND_SLOT_MS) {
                 FS_Record_t rec;
-                /* 每3条历史插1条最新：优先发历史（队首） */
-                if (FS_Peek(&rec, true)) {
-                    Dtu_SendRecord(&rec);
+                /* 契约 §8.2：默认补历史（队首，保留原 msg_id/sampled_at）；
+                   每补传 DTU_HIST_PER_NEW 条历史，插发一条最新，避免实时数据被饿死。
+                   插队只是调度优先级，不改变 60s 采样节律（不额外生成样本）。 */
+                bool send_latest = false;
+                if (s_hist_sent >= DTU_HIST_PER_NEW) {
+                    if (FS_PeekLatest(&rec)) {
+                        send_latest = true;
+                        s_hist_sent = 0;
+                    }
+                }
+                if (!send_latest) {
+                    if (!FS_Peek(&rec, true)) break;
                     s_hist_sent++;
                 }
+                Dtu_SendRecord(&rec);
             }
         }
         break;
@@ -290,7 +338,9 @@ void Dtu_Init(void)
     s_state = DTU_IDLE;
     s_rx_len = 0;
     s_last_send_ms = 0;
-    s_last_record_ms = 0;
+    /* 以当前时刻为基准，第一条记录在 60s 后生成（契约 §8.1）。
+       若置 0，HAL_GetTick() 起点接近 0 会导致上电瞬间立即写一条。 */
+    s_last_record_ms = HAL_GetTick();
     s_hist_sent = 0;
     s_retry_cnt = 0;
 

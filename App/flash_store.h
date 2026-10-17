@@ -46,9 +46,11 @@
 /* 采样节律（契约 §8.1） */
 #define FLASH_STORE_SAMPLE_MS      60000   /* 每60秒持久化一条新记录 */
 
-/* 数据定点倍率（契约 §10.6） */
+/* 数据定点倍率（契约 §10.6）
+   注意：光照量用 FS_FIXED_UINT1，保持 uint32 语义，禁止走 float/int32 中转。 */
 #define FS_FIXED_DIV10(x)   ((int32_t)((x) * 10.0f))
 #define FS_FIXED_DIV1(x)    ((int32_t)(x))
+#define FS_FIXED_UINT1(x)   ((uint32_t)(x))
 
 /* 8 通道索引（与 valid 位图、契约 §3.2 对应） */
 enum {
@@ -105,6 +107,10 @@ void FS_MarkConfirmed(uint32_t boot_id, uint32_t seq);
 /* 读出队列头部一条未确认记录（供发送）。无则返回 false。
    peek=true 不移动读指针；peek=false 出队一条 */
 bool FS_Peek(FS_Record_t *rec, bool peek);
+
+/* 读出队列尾部一条未确认记录（最新一条），供契约 §8.2 插队发送。
+   不出队；无则返回 false。 */
+bool FS_PeekLatest(FS_Record_t *rec);
 
 /* 队列中未确认记录数 */
 uint32_t FS_PendingCount(void);

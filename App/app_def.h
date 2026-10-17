@@ -28,7 +28,10 @@ typedef struct
     float    air_temp;       /* 空气温度   ℃   */
     float    air_humi;       /* 空气湿度   %RH */
     float    co2;            /* CO2浓度   ppm  */
-    float    lux;            /* 光照强度   lux  */
+    /* 光照：32位寄存器，量程可达 4.29e9。
+       契约 §10.6 要求 uint32 完整保留无符号寄存器值；
+       用 float 存储会在 >2^24 时丢精度，转 int32 更会溢出成负数。 */
+    uint32_t lux;            /* 光照强度   lux  */
     float    pressure;        /* 大气压强   hPa  */
 
     /* 土壤三合一 */

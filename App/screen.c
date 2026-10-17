@@ -163,7 +163,8 @@ void Screen_FormatLux(uint8_t *out, uint16_t *out_len)
     out[2] = 0xD5; out[3] = 0xD5;  /* 照 */
     out[4] = 0x3A;
     if (g_env.ble_box_valid)
-        *out_len = (uint16_t)sprintf((char*)out + 5, "%d", (int)g_env.lux) + 5;
+        /* lux 为 uint32，按无符号打印，避免大光照时转 int 变负 */
+        *out_len = (uint16_t)sprintf((char*)out + 5, "%lu", (unsigned long)g_env.lux) + 5;
     else
         *out_len = (uint16_t)sprintf((char*)out + 5, "----") + 5;
     out[(*out_len)++] = 0x4C;  /* L */
