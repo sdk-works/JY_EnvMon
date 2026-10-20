@@ -9,8 +9,8 @@
 
 #include "app_def.h"
 
-/* 上屏一条滚动文本 */
-void Screen_ShowScroll(const uint8_t *text, uint16_t len);
+/* 上屏一条单行固定文本（不滚动，由 app.c 定时切换下一条） */
+void Screen_ShowFixed(const uint8_t *text, uint16_t len);
 
 /* 格式化8条轮播文本 */
 void Screen_FormatTemp(uint8_t *out, uint16_t *out_len);

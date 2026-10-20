@@ -103,7 +103,7 @@ void APP_Loop(void)
             return;
         }
 
-        Screen_ShowScroll(text, tlen);
+        Screen_ShowFixed(text, tlen);
         s_screen_idx = (s_screen_idx + 1) % SCREEN_ITEM_NUM;
     }
 
