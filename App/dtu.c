@@ -3,12 +3,13 @@
   * @file    dtu.c
   * @brief   DTU(DR154) 可靠上报云平台实现 —— 契约 v1.2
   *
-  * 通过 USART1(RS232, 9600 8N1) 发单行JSON到DR154，DR154以MQTT透传到云端。
-  * 云端落库成功后回 agri/device/{id}/ack (upload_ack)，本模块按 \n 切帧接收，
-  * 匹配 msg_id 后调用 FS_MarkConfirmed 出队。
+ * 通过 USART1(RS232, 9600 8N1) 发单行JSON到DR154，DR154以MQTT透传到云端。
+ * 云端落库成功后回 agri/device/{id}/ack (upload_ack)，本模块按 '{}' 对象边界解析
+ * （兼容 DTU 下行把 '\n' 剥掉的情况，不再依赖尾随换行切帧），匹配 msg_id 后
+ * 调用 FS_MarkConfirmed 出队。
   *
   * 上报状态机（契约 §8）：
-  *   每60s持久化一条新记录(flash_store)；发送槽≥5s；
+  *   每 DTU_NEW_RECORD_MS 持久化一条新记录(flash_store)；发送槽≥DTU_SEND_SLOT_MS；
   *   优先补历史(每3条插1条最新)；未确认退避重发(上限300s)；链路疑似故障走周期探测。
   ******************************************************************************
   */
@@ -185,32 +186,50 @@ static int Dtu_ParseAck(const uint8_t *line, uint16_t len)
     return 0;
 }
 
-/* 处理接收缓冲：按 \n 切帧，逐帧解析 */
+/* 处理接收缓冲：不再依赖尾随 '\n' 切帧。
+   DTU 下行透传 ACK 时可能剥掉 '\n'，原按 '\n' 切帧会永远收不到 ACK，
+   导致同一条记录无限重发（用户观察到的"重复消息"）。
+   改为：只要缓冲中出现一个完整 JSON 对象（配对的 '{'...'}'），即解析为一帧 ACK。 */
 static void Dtu_ProcessRx(void)
 {
     uint16_t i = 0;
     while (i < s_rx_len) {
-        /* 找换行 */
-        uint16_t j = i;
-        while (j < s_rx_len && s_rx_buf[j] != '\n') j++;
-        if (j >= s_rx_len) break;   /* 半帧，等后续 */
-        uint16_t linelen = j - i;
-        if (linelen > 0) {
-            Dtu_ParseAck(&s_rx_buf[i], linelen);
+        /* 找对象闭合符 '}' */
+        if (s_rx_buf[i] != '}') { i++; continue; }
+        /* 从该 '}' 向前找最近的匹配 '{'（ACK 为扁平 JSON，无嵌套） */
+        int open = -1;
+        for (int k = (int)i - 1; k >= 0; k--) {
+            if (s_rx_buf[k] == '{') { open = k; break; }
         }
-        i = j + 1;
+        if (open < 0) { i++; continue; }   /* 无配对 '{'，跳过该 '}' */
+        uint16_t objlen = (uint16_t)(i - open + 1);
+        Dtu_ParseAck(&s_rx_buf[open], objlen);
+        /* 消费已解析段 [open, i]，把后续未处理字节前移 */
+        uint16_t rest = s_rx_len - i - 1;
+        if (rest > 0) memmove(&s_rx_buf[open], &s_rx_buf[i + 1], rest);
+        s_rx_len = rest;
+        i = open;   /* 从合并点继续扫描后续帧（支持连续多帧无分隔） */
     }
-    /* 保留最后未换行部分（如有）到缓冲头 */
-    if (i < s_rx_len) {
-        uint16_t remain = s_rx_len - i;
-        memmove(s_rx_buf, &s_rx_buf[i], remain);
-        s_rx_len = remain;
-    } else {
-        s_rx_len = 0;
+    /* 去掉首部非对象字节（防止无关垃圾在缓冲头部堆积） */
+    if (s_rx_len > 0 && s_rx_buf[0] != '{') {
+        uint16_t first = 0;
+        for (uint16_t k = 0; k < s_rx_len; k++) {
+            if (s_rx_buf[k] == '{') { first = k; break; }
+        }
+        if (first > 0) {
+            memmove(s_rx_buf, &s_rx_buf[first], s_rx_len - first);
+            s_rx_len -= first;
+        }
     }
+    /* 若残余中已无 '{'，视为垃圾直接清空（避免缓冲头部无关字节长期驻留） */
+    int has_open = 0;
+    for (uint16_t k = 0; k < s_rx_len; k++) {
+        if (s_rx_buf[k] == '{') { has_open = 1; break; }
+    }
+    if (!has_open) s_rx_len = 0;
 }
 
-/* 判断是否到时间生成一条新记录并持久化（契约 §8.1：每60s） */
+/* 判断是否到时间生成一条新记录并持久化（契约 §8.1：每 DTU_NEW_RECORD_MS） */
 static void Dtu_MaybeNewRecord(void)
 {
     uint32_t now = HAL_GetTick();

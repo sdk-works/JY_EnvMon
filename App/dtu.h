@@ -5,7 +5,8 @@
   *          契约 v1.2 §2/§3/§7/§8
   *
   *  上行:   agri/device/{device_id}/up   单行JSON + \n
-  *  下行:   agri/device/{device_id}/ack  单行JSON + \n (upload_ack)
+  *  下行:   agri/device/{device_id}/ack  单行JSON(upload_ack)；
+ *          本端按 '{}' 对象边界解析，兼容 DTU 下行剥掉 '\n' 的情况。
   *
   *  上报状态机（契约 §8.2/§8.3）：
   *    - 每60s持久化一条新记录(flash_store)
@@ -21,9 +22,11 @@
 /* 上报身份（与云端 Device.device_id 一致） */
 #define DTU_DEVICE_ID     "JY001"
 
-/* 节律参数（契约 §8） */
-#define DTU_SEND_SLOT_MS      5000      /* 发送槽最小间隔 */
-#define DTU_NEW_RECORD_MS     60000     /* 每60s生成一条新记录 */
+/* 节律参数（契约 §8）
+   注意：以下为【测试临时值】，验证 ACK 重复问题解决后需改回：
+         DTU_SEND_SLOT_MS 5000、DTU_NEW_RECORD_MS 60000。 */
+#define DTU_SEND_SLOT_MS      2000      /* 测试：发送槽最小间隔 2s（正式 5000） */
+#define DTU_NEW_RECORD_MS     10000     /* 测试：每10s生成一条新记录（正式 60000） */
 #define DTU_HIST_PER_NEW      3         /* 每补传3条历史，插1条最新 */
 
 /* DTU 状态机 */
