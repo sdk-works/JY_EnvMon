@@ -64,21 +64,16 @@
 #define SCREEN_FONT_NAME_EN  "E000"   /* 6×8  英文/数字 */
 #define SCREEN_FONT_ESC_LEN   6U      /* "\F" + 4 位字库名 */
 
-/* ===== 单位（全部 ASCII，走英文字库；单位区高 8px） ===== */
-/* 温度单位说明：
-   ℃ 在 GB2312 里是 A1E6、单独的 ° 是 A1E3，都属于全角中文符号区，只有 12×12
-   中文字库里有，塞不进 8px 高的单位区；而 ASCII 里没有 ° 字符。
-   所以“把 ℃ 拆成 ° + C”并不能解决问题——° 本身同样只有中文字库里才有。
-   想显示 °C，用下面这个开关：
-     SCREEN_TEMP_UNIT_MODE = 0 → 直接显示 "C"（默认，零额外字库，语义上即摄氏度）
-     SCREEN_TEMP_UNIT_MODE = 1 → 显示 "°C"：需在英文字库 E000 里把 SCREEN_DEG_CHAR
-                                 这个码位的字形改成 °，两个字符都是 6×8，同字库同区域，
-                                 高度天然一致，不会出现基线不齐。 */
-#define SCREEN_TEMP_UNIT_MODE   0
-#define SCREEN_DEG_CHAR         "^"    /* 承载 ° 的 ASCII 码位(0x5E)，请在字库里改它的字形 */
+/* ===== 单位（走英文字库；单位区高 8px） ===== */
+/* 温度单位：方案 C —— 单独的 ≤8px 高 ℃ 小字库。
+   ℃ 在 GB2312 里是 A1E6（全角），12×12 中文字库塞不进 8px 高的单位区，
+   所以另做一个只含 ℃ 的 8px 高小字库（默认名 O001），温度项的单位区改走它。
+   若 O001 尚未做好，把 SCREEN_TEMP_UNIT_CJK8 置 0，可退回 ASCII "C"（走 E000）。 */
+#define SCREEN_TEMP_UNIT_CJK8   1
+#define SCREEN_FONT_NAME_CJK8   "O001"   /* 8px 高中文小字库，至少含 ℃ */
 
-#if SCREEN_TEMP_UNIT_MODE
-  #define U_TEMP  SCREEN_DEG_CHAR "C"
+#if SCREEN_TEMP_UNIT_CJK8
+  #define U_TEMP  "\xA1\xE6"   /* ℃（GB2312 A1E6），由 O001 渲染 */
 #else
   #define U_TEMP  "C"
 #endif
@@ -273,6 +268,7 @@ void Screen_ShowItem(uint8_t idx)
 {
     static uint8_t frame[SCREEN_WIRE_MAX];
     const uint8_t *name = NM_TEMP;
+    const char *uni_font = SCREEN_FONT_NAME_EN;
     uint16_t nlen = 4;
     char val[16];
     char uni[8];
@@ -355,6 +351,11 @@ void Screen_ShowItem(uint8_t idx)
         return;
     }
 
+#if SCREEN_TEMP_UNIT_CJK8
+    /* 温度/土温的 ℃ 走 8px 小字库 O001，其余单位仍走英文字库 E000 */
+    if (idx == 0 || idx == 5) uni_font = SCREEN_FONT_NAME_CJK8;
+#endif
+
     /* 超宽保护：>6 字符显示 ERR，不截断前后数字 */
     if (vlen > SCREEN_VAL_MAX) { strcpy(val, "ERR"); vlen = 3; }
     if (ulen > SCREEN_VAL_MAX) { strcpy(uni, "ERR"); ulen = 3; }
@@ -378,7 +379,7 @@ void Screen_ShowItem(uint8_t idx)
         /* 单位区 */
         areas[2].x = AREA_UNI_X; areas[2].y = AREA_UNI_Y;
         areas[2].w = AREA_UNI_W; areas[2].h = AREA_UNI_H;
-        areas[2].font = SCREEN_FONT_NAME_EN;
+        areas[2].font = uni_font;
         areas[2].text = (const uint8_t *)uni; areas[2].len = ulen;
 
         flen = Screen_BuildFrame(areas, 3, frame);
