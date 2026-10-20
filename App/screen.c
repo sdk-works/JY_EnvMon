@@ -9,6 +9,9 @@
   *   单位区  X=26, Y=8 , W=38, H=8    最多 6 个 6×8 ASCII 字符
   *   左右间隔 2 像素；名称区 Y=2 使 12px 字落在 16px 屏正中。
   *
+  * 温度单位 = "°C"：同一单位区内先切中文字库输出 °(A1E3)，再切英文字库输出 C。
+  *   协议允许在内容中间用 \F 反复切换字库，因此一个区域可混用不同字库。
+  *
   * 协议要点（BX-5K/6K 通讯协议）：
   *   帧头 8×0xA5，帧尾 0x5A，包校验 CRC16(初值0, poly=0xA001)
   *   命令 A3 06 = 发送实时显示区域数据，数据域结构：
@@ -19,7 +22,7 @@
   *
   * 字库（协议 §11.1：内容开始处必须用 "\F"+字库名 指定字库）：
   *   中文 O000 = 12×12 宋体；英文/数字 E000 = 6×8 Arial。
-  *   程序按区域分别调用字库，不把不同高度的字混在同一区域。
+  *   程序按区域分别调用字库，中英文分区域/分段，不把不同高度的字混在同一段。
   ******************************************************************************
   */
 #include "screen.h"
@@ -64,19 +67,17 @@
 #define SCREEN_FONT_NAME_EN  "E000"   /* 6×8  英文/数字 */
 #define SCREEN_FONT_ESC_LEN   6U      /* "\F" + 4 位字库名 */
 
-/* ===== 单位（走英文字库；单位区高 8px） ===== */
-/* 温度单位：方案 C —— 单独的 ≤8px 高 ℃ 小字库。
-   ℃ 在 GB2312 里是 A1E6（全角），12×12 中文字库塞不进 8px 高的单位区，
-   所以另做一个只含 ℃ 的 8px 高小字库（默认名 O001），温度项的单位区改走它。
-   若 O001 尚未做好，把 SCREEN_TEMP_UNIT_CJK8 置 0，可退回 ASCII "C"（走 E000）。 */
-#define SCREEN_TEMP_UNIT_CJK8   1
-#define SCREEN_FONT_NAME_CJK8   "O001"   /* 8px 高中文小字库，至少含 ℃ */
+/* ===== 单位 ===== */
+/* 温度单位 = °(中文字库) + C(英文字库) 拼接，同一单位区内中途切换 \F：
+ *   ° 在 GB2312 是 A1E3，只有中文字库有；C 走 6×8 英文字库。
+ *   注意：° 来自 12×12 中文字模，而单位区仅 8px 高——° 字形位于字模上部，
+ *   正常情况不会落到被裁的底部。若实测 ° 被切或与 C 基线不齐，
+ *   把 SCREEN_TEMP_UNIT_DEG_C 置 0，退回单一 ASCII "C"。 */
+#define SCREEN_TEMP_UNIT_DEG_C   1
 
-#if SCREEN_TEMP_UNIT_CJK8
-  #define U_TEMP  "\xA1\xE6"   /* ℃（GB2312 A1E6），由 O001 渲染 */
-#else
-  #define U_TEMP  "C"
-#endif
+static const uint8_t U_DEG[] = {0xA1, 0xE3};   /* ° GB2312 A1E3（中文字库） */
+static const uint8_t U_C  [] = {'C'};          /* C ASCII（英文字库） */
+
 #define U_RH     "%RH"
 #define U_PPM    "ppm"
 #define U_LX     "lx"
@@ -86,19 +87,18 @@
 #define U_EC     "uS/cm"
 
 /* ===== 缓冲尺寸 ===== */
-#define SCREEN_DATA_MAX    16U    /* 每区域数据上限：\F(6) + 文本(<=6) 余量 */
-#define SCREEN_REGION_LEN  23U    /* 区域头固定 23 字节 */
-#define SCREEN_BLOCK_MAX   (2U + SCREEN_REGION_LEN + 4U + SCREEN_DATA_MAX)  /* 45 */
-#define SCREEN_DOMAIN_MAX  (7U + 3U * SCREEN_BLOCK_MAX)                     /* 142 */
-#define SCREEN_RAW_MAX     (14U + SCREEN_DOMAIN_MAX + 2U)                   /* 158，含 CRC2 */
-#define SCREEN_WIRE_MAX    (8U + 2U * SCREEN_RAW_MAX + 1U)                  /* 325 */
+#define SCREEN_AREA_DATA_MAX  20U   /* 每区域数据上限：\F 各段之和 */
+#define SCREEN_REGION_LEN     23U   /* 区域头固定 23 字节 */
+#define SCREEN_BLOCK_MAX      (2U + SCREEN_REGION_LEN + 4U + SCREEN_AREA_DATA_MAX)  /* 49 */
+#define SCREEN_DOMAIN_MAX     (7U + 3U * SCREEN_BLOCK_MAX)                          /* 154 */
+#define SCREEN_RAW_MAX        (14U + SCREEN_DOMAIN_MAX + 2U)                        /* 170 */
+#define SCREEN_WIRE_MAX       (8U + 2U * SCREEN_RAW_MAX + 1U)                       /* 349 */
 
-/* 一帧内的一个显示区域 */
+/* 一帧内的一个显示区域：data 已是含 \F 字库转义的完整显示数据 */
 typedef struct {
     uint16_t x, y, w, h;
-    const char    *font;   /* 4 位字库名 */
-    const uint8_t *text;   /* 文本字节（中文 GB2312 / 英文 ASCII） */
-    uint16_t       len;    /* 文本字节数 */
+    uint8_t  data[SCREEN_AREA_DATA_MAX];
+    uint16_t len;
 } Screen_Area_t;
 
 /* ===== 名称（GB2312 / ASCII） ===== */
@@ -147,6 +147,16 @@ static uint16_t fmt_na(char *buf)
     return 2;
 }
 
+/* 向区域数据追加一段：\F + 字库名(4) + 文本；返回写入字节数 */
+static uint16_t Screen_Seg(uint8_t *dst, const char *font, const uint8_t *text, uint16_t n)
+{
+    dst[0] = 0x5C;                 /* '\' */
+    dst[1] = 'F';
+    memcpy(dst + 2, font, 4);
+    if (n) memcpy(dst + SCREEN_FONT_ESC_LEN, text, n);
+    return (uint16_t)(SCREEN_FONT_ESC_LEN + n);
+}
+
 /* 组一帧（N 个区域），返回转义后的线上字节数 */
 static uint16_t Screen_BuildFrame(const Screen_Area_t *areas, uint8_t n, uint8_t *out)
 {
@@ -181,7 +191,7 @@ static uint16_t Screen_BuildFrame(const Screen_Area_t *areas, uint8_t n, uint8_t
 
     for (i = 0; i < n; i++) {
         const Screen_Area_t *a = &areas[i];
-        uint16_t dataLen = (uint16_t)(SCREEN_FONT_ESC_LEN + a->len);
+        uint16_t dataLen = a->len;
         uint16_t areaLen = (uint16_t)(SCREEN_REGION_LEN + 4U + dataLen);
 
         /* 区域数据长度（2 字节，小端） */
@@ -218,11 +228,8 @@ static uint16_t Screen_BuildFrame(const Screen_Area_t *areas, uint8_t n, uint8_t
         *p++ = 0x00;
         *p++ = 0x00;
 
-        /* ---- 显示数据：\F + 字库名(4) + 文本 ---- */
-        *p++ = 0x5C;                                     /* '\' */
-        *p++ = 'F';
-        memcpy(p, a->font, 4); p += 4;
-        if (a->len) { memcpy(p, a->text, a->len); p += a->len; }
+        /* ---- 显示数据（已含 \F 字库转义，可直接多段拼接） ---- */
+        if (dataLen) { memcpy(p, a->data, dataLen); p += dataLen; }
     }
 
     /* 回填数据域长度（不含包头/包校验/帧尾/帧头） */
@@ -254,7 +261,7 @@ static uint16_t Screen_BuildFrame(const Screen_Area_t *areas, uint8_t n, uint8_t
 }
 
 /* HAL_UART_Transmit 成功会等到 TC；超时只用于界定失败。三区域帧在 9600bps
-   下约 150~310ms，故给 1000ms。 */
+   下约 150~320ms，故给 1000ms。 */
 static void Screen_Send(const uint8_t *data, uint16_t len)
 {
     if (len == 0) return;
@@ -267,13 +274,15 @@ static void Screen_Send(const uint8_t *data, uint16_t len)
 void Screen_ShowItem(uint8_t idx)
 {
     static uint8_t frame[SCREEN_WIRE_MAX];
+    Screen_Area_t areas[3];
     const uint8_t *name = NM_TEMP;
-    const char *uni_font = SCREEN_FONT_NAME_EN;
+    const char *name_font = SCREEN_FONT_NAME_CN;
     uint16_t nlen = 4;
     char val[16];
     char uni[8];
     uint16_t vlen = 0, ulen = 0;
-    uint8_t valid;
+    uint8_t valid = 0;
+    uint8_t temp_unit = 0;   /* 1 = 温度类，单位由 °(中文) + C(英文) 拼接 */
 
     val[0] = '\0';
     uni[0] = '\0';
@@ -283,7 +292,7 @@ void Screen_ShowItem(uint8_t idx)
         name = NM_TEMP; nlen = 4;
         valid = g_env.ble_box_valid;
         vlen = valid ? fmt_f1(val, g_env.air_temp) : fmt_na(val);
-        strcpy(uni, U_TEMP); ulen = (uint16_t)strlen(uni);
+        temp_unit = 1;
         break;
 
     case 1: /* 空气湿度 */
@@ -329,7 +338,7 @@ void Screen_ShowItem(uint8_t idx)
         name = NM_STMP; nlen = 4;
         valid = g_env.soil_valid;
         vlen = valid ? fmt_f1(val, g_env.soil_temp) : fmt_na(val);
-        strcpy(uni, U_TEMP); ulen = (uint16_t)strlen(uni);
+        temp_unit = 1;
         break;
 
     case 6: /* 土壤湿度 */
@@ -351,38 +360,41 @@ void Screen_ShowItem(uint8_t idx)
         return;
     }
 
-#if SCREEN_TEMP_UNIT_CJK8
-    /* 温度/土温的 ℃ 走 8px 小字库 O001，其余单位仍走英文字库 E000 */
-    if (idx == 0 || idx == 5) uni_font = SCREEN_FONT_NAME_CJK8;
-#endif
-
     /* 超宽保护：>6 字符显示 ERR，不截断前后数字 */
     if (vlen > SCREEN_VAL_MAX) { strcpy(val, "ERR"); vlen = 3; }
     if (ulen > SCREEN_VAL_MAX) { strcpy(uni, "ERR"); ulen = 3; }
 
+    /* ---- 名称区：中文用中文字库，纯 ASCII（CO2）用英文字库 ---- */
+    if (name[0] < 0x80) name_font = SCREEN_FONT_NAME_EN;
+    areas[0].x = AREA_NAME_X; areas[0].y = AREA_NAME_Y;
+    areas[0].w = AREA_NAME_W; areas[0].h = AREA_NAME_H;
+    areas[0].len = Screen_Seg(areas[0].data, name_font, name, nlen);
+
+    /* ---- 数值区：英文字库 ---- */
+    areas[1].x = AREA_VAL_X; areas[1].y = AREA_VAL_Y;
+    areas[1].w = AREA_VAL_W; areas[1].h = AREA_VAL_H;
+    areas[1].len = Screen_Seg(areas[1].data, SCREEN_FONT_NAME_EN, (const uint8_t *)val, vlen);
+
+    /* ---- 单位区 ---- */
+    areas[2].x = AREA_UNI_X; areas[2].y = AREA_UNI_Y;
+    areas[2].w = AREA_UNI_W; areas[2].h = AREA_UNI_H;
+
+    if (temp_unit) {
+#if SCREEN_TEMP_UNIT_DEG_C
+        uint16_t o = 0;
+        /* 同一区域内：\F中文字库 + °，再 \F英文字库 + C */
+        o = Screen_Seg(areas[2].data, SCREEN_FONT_NAME_CN, U_DEG, 2);
+        o = (uint16_t)(o + Screen_Seg(areas[2].data + o, SCREEN_FONT_NAME_EN, U_C, 1));
+        areas[2].len = o;
+#else
+        areas[2].len = Screen_Seg(areas[2].data, SCREEN_FONT_NAME_EN, U_C, 1);
+#endif
+    } else {
+        areas[2].len = Screen_Seg(areas[2].data, SCREEN_FONT_NAME_EN, (const uint8_t *)uni, ulen);
+    }
+
     {
-        Screen_Area_t areas[3];
-        uint16_t flen;
-
-        /* 名称区：中文用中文字库，纯 ASCII（CO2）用英文字库 */
-        areas[0].x = AREA_NAME_X; areas[0].y = AREA_NAME_Y;
-        areas[0].w = AREA_NAME_W; areas[0].h = AREA_NAME_H;
-        areas[0].font = (name[0] < 0x80) ? SCREEN_FONT_NAME_EN : SCREEN_FONT_NAME_CN;
-        areas[0].text = name; areas[0].len = nlen;
-
-        /* 数值区 */
-        areas[1].x = AREA_VAL_X; areas[1].y = AREA_VAL_Y;
-        areas[1].w = AREA_VAL_W; areas[1].h = AREA_VAL_H;
-        areas[1].font = SCREEN_FONT_NAME_EN;
-        areas[1].text = (const uint8_t *)val; areas[1].len = vlen;
-
-        /* 单位区 */
-        areas[2].x = AREA_UNI_X; areas[2].y = AREA_UNI_Y;
-        areas[2].w = AREA_UNI_W; areas[2].h = AREA_UNI_H;
-        areas[2].font = uni_font;
-        areas[2].text = (const uint8_t *)uni; areas[2].len = ulen;
-
-        flen = Screen_BuildFrame(areas, 3, frame);
+        uint16_t flen = Screen_BuildFrame(areas, 3, frame);
         Screen_Send(frame, flen);
     }
 }
