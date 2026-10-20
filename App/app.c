@@ -3,9 +3,9 @@
   * @file    app.c
   * @brief   京阳温室环境监测主调度
   *
-  * 周期：
-  *   每3秒  采集一次传感器
-  *   按文本长短决定每条停留时间，播完再切下一条
+ * 周期：
+ *   每3秒  采集一次传感器
+ *   每8秒  切换一项屏幕指标（左名称 + 右上数值 + 右下单位）
   ******************************************************************************
   */
 #include "app.h"
@@ -33,21 +33,8 @@ static void App_IwdgInit(void)
     }
 }
 
-/* 每条文本的停留时间(ms)，按像素宽度分档：
- *   最短(≤72px) = 8秒   → 土湿、EC
- *   中(80~88px) = 10秒  → 温度、湿度、CO2、光照、土温
- *   长(≥100px)  = 12秒  → 气压
- */
-static const uint16_t s_dwell_ms[SCREEN_ITEM_NUM] = {
-    10000,  /* 0 温度 */
-    10000,  /* 1 湿度 */
-    10000,  /* 2 CO2 */
-    10000,  /* 3 光照 */
-    12000,  /* 4 气压 */
-    10000,  /* 5 土温 */
-    8000,   /* 6 土湿 */
-    8000,   /* 7 EC */
-};
+/* 每项指标静态显示停留时间：统一 8 秒（布局固定，不再按文本宽度分档） */
+#define SCREEN_DWELL_MS     8000
 
 static uint32_t s_last_collect = 0;
 static uint32_t s_last_screen  = 0;
@@ -74,8 +61,6 @@ static void App_FeedWatchdog(void)
 void APP_Loop(void)
 {
     uint32_t now = HAL_GetTick();
-    uint8_t  text[32];
-    uint16_t tlen;
 
     Bus_Tick1ms();
     Dtu_Tick();
@@ -86,25 +71,11 @@ void APP_Loop(void)
     }
 
     /* 当前条停留时间到了，切下一条 */
-    if (now - s_last_screen >= s_dwell_ms[s_screen_idx]) {
+    if (now - s_last_screen >= SCREEN_DWELL_MS) {
         s_last_screen = now;
 
-        switch (s_screen_idx) {
-        case 0: Screen_FormatTemp(text, &tlen); break;
-        case 1: Screen_FormatHumi(text, &tlen); break;
-        case 2: Screen_FormatCO2(text, &tlen); break;
-        case 3: Screen_FormatLux(text, &tlen); break;
-        case 4: Screen_FormatPressure(text, &tlen); break;
-        case 5: Screen_FormatSoilTemp(text, &tlen); break;
-        case 6: Screen_FormatSoilHumi(text, &tlen); break;
-        case 7: Screen_FormatEC(text, &tlen); break;
-        default:
-            s_screen_idx = 0;
-            return;
-        }
-
-        Screen_ShowFixed(text, tlen);
-        s_screen_idx = (s_screen_idx + 1) % SCREEN_ITEM_NUM;
+        Screen_ShowItem(s_screen_idx);
+        s_screen_idx = (uint8_t)((s_screen_idx + 1) % SCREEN_ITEM_NUM);
     }
 
     App_FeedWatchdog();

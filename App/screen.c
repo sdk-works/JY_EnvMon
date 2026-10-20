@@ -1,278 +1,371 @@
 /**
   ******************************************************************************
   * @file    screen.c
-  * @brief   BX-5K1 LED大屏驱动：组单行固定显示帧并发送（不做滚动，由固件定时切下一条）
+  * @brief   BX-5K1 LED 大屏驱动：左中文名称 + 右上数值 + 右下单位（三区域单帧）
   *
-  * 协议要点（调试记录验证通过）：
-  *   帧头8×0xA5，帧尾0x5A
-  *   包头14字节：DstAddr(2)+SrcAddr(2)+保留(3)+条码(1)+校验(1)+
-  *              动态优先(1)+通配(1)+版本(1)+DataLen(2)
-  *   CRC16: 初值0x0000, poly=0xA001, 低字节先发
-  *   区域DisplayMode=00静止(单行固定)，ProcessMode=01清区域重发
+  * 布局（物理 64×16 像素，每次整屏只显示一项指标，8 秒切换）：
+  *   名称区  X=0 , Y=2 , W=24, H=12   两个 12×12 汉字（CO2 用 6×8 英文）
+  *   数值区  X=26, Y=0 , W=38, H=8    最多 6 个 6×8 ASCII 字符
+  *   单位区  X=26, Y=8 , W=38, H=8    最多 6 个 6×8 ASCII 字符
+  *   左右间隔 2 像素；名称区 Y=2 使 12px 字落在 16px 屏正中。
+  *
+  * 协议要点（BX-5K/6K 通讯协议）：
+  *   帧头 8×0xA5，帧尾 0x5A，包校验 CRC16(初值0, poly=0xA001)
+  *   命令 A3 06 = 发送实时显示区域数据，数据域结构：
+  *     A3 06 Resp ProcessMode 00 DeleteAreaNum AreaNum
+  *     [ AreaDataLen(2字节, 小端) + AreaBlock ] × AreaNum
+  *   AreaBlock = 区域头(23字节) + DataLen(4字节, 小端) + Data(含 \F 字库转义)
+  *   注意：外层 AreaDataLen 是 2 字节，区域末尾 DataLen 是 4 字节，二者不同。
+  *
+  * 字库（协议 §11.1：内容开始处必须用 "\F"+字库名 指定字库）：
+  *   中文 O000 = 12×12 宋体；英文/数字 E000 = 6×8 Arial。
+  *   程序按区域分别调用字库，不把不同高度的字混在同一区域。
   ******************************************************************************
   */
 #include "screen.h"
 #include <string.h>
 #include <stdio.h>
 
-/* 字库尺寸（用户在 BX-5K1 字库工具中设置）：英文 6×6，中文 8字号/渲染框 10×10 */
-#define SCREEN_FONT_EN_W   6
-#define SCREEN_FONT_EN_H   6
-#define SCREEN_FONT_CN_W   10
-#define SCREEN_FONT_CN_H   10
-#define SCREEN_WIDTH_PX    64      /* BX-5K1 物理宽度 64×16 */
+/* ===== 字库尺寸（须与仰邦字库工具里生成的字模一致） ===== */
+#define SCREEN_CN_W        12
+#define SCREEN_CN_H        12
+#define SCREEN_EN_W         6
+#define SCREEN_EN_H         8
 
-/* 字库名（协议 §11.1：区域 Data 前必须用 "\F"+字库名 指定字库，否则控制器用默认字库；
-   用户下载过自定义字库后，默认字库槽数据不匹配 → 中文按错误字模取点阵 = 乱码）。
-   标准字库名：O000=16点阵中文 O001=24点阵 O002=32点阵；E000=16点阵英文 …
-   自定义 10×10 中文 / 6×6 英文：填仰邦字库工具里显示的“字库名”（O 开头/ E 开头各 4 位）。
-   若不确定，先用 O000 / E000（出厂标准）验证：中文能正常认出即证明是字库选择问题。 */
-#define SCREEN_FONT_NAME_CN  "O000"   /* 中文字库名（自定义 10×10 时改成实际名，如 O008） */
-#define SCREEN_FONT_NAME_EN  "E000"   /* 英文字库名（自定义 6×6 时改成实际名，如 E006） */
+/* ===== 三区域几何（像素） ===== */
+#define AREA_NAME_X         0
+#define AREA_NAME_Y         2
+#define AREA_NAME_W        24
+#define AREA_NAME_H        12
 
-/* 字库转义前缀："\F"+4位字库名，中英各一个 = 12 字节 */
-#define SCREEN_FONT_ESC_LEN 12U
+#define AREA_VAL_X         26
+#define AREA_VAL_Y          0
+#define AREA_VAL_W         38
+#define AREA_VAL_H          8
 
-/* 区域显示模式：00=单行静止（需求：不做滚动）；03=左移（原滚动效果，已弃用） */
-#define SCREEN_AREA_MODE_FIXED    0x00
-#define SCREEN_AREA_MODE_LSCROLL  0x03
+#define AREA_UNI_X         26
+#define AREA_UNI_Y          8
+#define AREA_UNI_W         38
+#define AREA_UNI_H          8
 
-/* LED CRC16: 初值0, poly=0xA001 */
+/* 单个区域最多字符数：38px / 6px = 6 */
+#define SCREEN_VAL_MAX      6
+
+/* ===== 区域显示参数 ===== */
+/* DisplayMode：本机实测 0x00 为静止（协议标称 0x01=静止，如需可改 0x01） */
+#define SCREEN_AREA_MODE_FIXED  0x00
+/* ProcessMode：1=收到动态信息后清区域并初始化（每帧重画三个区域，避免残影） */
+#define SCREEN_PROC_MODE        0x01
+/* TextAlignment 是位域：bit[1:0] 00左/01右/10居中，bit[3:2] 00上/01下/10居中 */
+#define SCREEN_ALIGN_CENTER     0x0A   /* 水平居中 + 垂直居中 */
+
+/* ===== 字库名（须与控制器内实际下载的字库名一致） ===== */
+#define SCREEN_FONT_NAME_CN  "O000"   /* 12×12 中文 */
+#define SCREEN_FONT_NAME_EN  "E000"   /* 6×8  英文/数字 */
+#define SCREEN_FONT_ESC_LEN   6U      /* "\F" + 4 位字库名 */
+
+/* ===== 单位（全部 ASCII，走英文字库；单位区高 8px） ===== */
+#define U_TEMP   "C"       /* 测试用 ASCII C；做好 8px 高 ℃ 字模后可改回 ℃（需走中文字库） */
+#define U_RH     "%RH"
+#define U_PPM    "ppm"
+#define U_LX     "lx"
+#define U_KLX    "klx"
+#define U_KPA    "kPa"
+#define U_PCT    "%"
+#define U_EC     "uS/cm"
+
+/* ===== 缓冲尺寸 ===== */
+#define SCREEN_DATA_MAX    16U    /* 每区域数据上限：\F(6) + 文本(<=6) 余量 */
+#define SCREEN_REGION_LEN  23U    /* 区域头固定 23 字节 */
+#define SCREEN_BLOCK_MAX   (2U + SCREEN_REGION_LEN + 4U + SCREEN_DATA_MAX)  /* 45 */
+#define SCREEN_DOMAIN_MAX  (7U + 3U * SCREEN_BLOCK_MAX)                     /* 142 */
+#define SCREEN_RAW_MAX     (14U + SCREEN_DOMAIN_MAX + 2U)                   /* 158，含 CRC2 */
+#define SCREEN_WIRE_MAX    (8U + 2U * SCREEN_RAW_MAX + 1U)                  /* 325 */
+
+/* 一帧内的一个显示区域 */
+typedef struct {
+    uint16_t x, y, w, h;
+    const char    *font;   /* 4 位字库名 */
+    const uint8_t *text;   /* 文本字节（中文 GB2312 / 英文 ASCII） */
+    uint16_t       len;    /* 文本字节数 */
+} Screen_Area_t;
+
+/* ===== 名称（GB2312 / ASCII） ===== */
+static const uint8_t NM_TEMP[] = {0xCE, 0xC2, 0xB6, 0xC8};  /* 温度 */
+static const uint8_t NM_HUMI[] = {0xCA, 0xAA, 0xB6, 0xC8};  /* 湿度 */
+static const uint8_t NM_CO2 [] = {'C',  'O',  '2'      };   /* CO2  */
+static const uint8_t NM_LUX [] = {0xB9, 0xE2, 0xD5, 0xD5};  /* 光照 */
+static const uint8_t NM_PRES[] = {0xC6, 0xF8, 0xD1, 0xB9};  /* 气压 */
+static const uint8_t NM_STMP[] = {0xCD, 0xC1, 0xCE, 0xC2};  /* 土温 */
+static const uint8_t NM_SHUM[] = {0xCD, 0xC1, 0xCA, 0xAA};  /* 土湿 */
+static const uint8_t NM_EC  [] = {0xB5, 0xE7, 0xB5, 0xBC};  /* 电导 */
+
+/* LED CRC16: 初值 0, poly=0xA001 */
 static uint16_t Screen_CRC16(const uint8_t *data, uint16_t len)
 {
     uint16_t crc = 0;
     uint16_t i;
     for (i = 0; i < len; i++) {
-        crc ^= data[i];
         uint8_t j;
+        crc ^= data[i];
         for (j = 0; j < 8; j++) {
-            if (crc & 1) crc = (crc >> 1) ^ 0xA001;
+            if (crc & 1) crc = (uint16_t)((crc >> 1) ^ 0xA001);
             else         crc >>= 1;
         }
     }
     return crc;
 }
 
-/*
- * 组单行固定显示帧（不滚动，静止显示）
- *   text     : GB2312编码文本
- *   text_len : 文本字节数
- *   out      : 输出缓冲区
- * 返回: 帧总长度
- * 注: 屏宽仅 64px，超宽时 Build_FixedFrame 内部尾部截断，避免错位
- */
-/* Maximum text supplied by the application; allow worst-case wire escaping. */
-#define SCREEN_TEXT_MAX 32U
-#define SCREEN_RAW_MAX  (14U + 36U + SCREEN_TEXT_MAX + SCREEN_FONT_ESC_LEN + 2U)
-#define SCREEN_WIRE_MAX (8U + 2U * SCREEN_RAW_MAX + 1U)
-
-/* 估算 GB2312 文本像素宽度（中文=SCREEN_FONT_CN_W，英文=SCREEN_FONT_EN_W），用于静态单行防溢出 */
-static uint16_t Screen_TextWidthPx(const uint8_t *text, uint16_t len)
+/* 一位小数定点格式化（整数运算，避免浮点 printf）：25.6 / -10.5 */
+static uint16_t fmt_f1(char *buf, float v)
 {
-    uint16_t w = 0, i = 0;
-    while (i < len) {
-        if (text[i] >= 0x80) { w += SCREEN_FONT_CN_W; i += 2; }
-        else                  { w += SCREEN_FONT_EN_W; i += 1; }
-    }
-    return w;
+    int neg = (v < 0.0f);
+    float a = neg ? -v : v;
+    uint32_t x = (uint32_t)(a * 10.0f + 0.5f);   /* 四舍五入到 0.1 */
+    int n;
+    if (x == 0) neg = 0;                          /* 吃掉 -0.0 */
+    if (neg) n = sprintf(buf, "-%lu.%lu", (unsigned long)(x / 10U), (unsigned long)(x % 10U));
+    else     n = sprintf(buf,  "%lu.%lu", (unsigned long)(x / 10U), (unsigned long)(x % 10U));
+    return (uint16_t)n;
 }
 
-/* 组单行固定显示帧（不滚动）：文本静止显示，由固件每隔固定时间切换下一条 */
-static uint16_t Build_FixedFrame(const uint8_t *text, uint16_t text_len, uint8_t *out)
+/* 无效读数占位：-- */
+static uint16_t fmt_na(char *buf)
 {
-    uint16_t len = text_len;
-    /* 超出单行物理宽度则尾部截断，避免静态显示被裁切/错位 */
-    while (Screen_TextWidthPx(text, len) > SCREEN_WIDTH_PX && len > 1) {
-        len -= (text[len - 1] >= 0x80) ? 2 : 1;
+    buf[0] = '-'; buf[1] = '-'; buf[2] = '\0';
+    return 2;
+}
+
+/* 组一帧（N 个区域），返回转义后的线上字节数 */
+static uint16_t Screen_BuildFrame(const Screen_Area_t *areas, uint8_t n, uint8_t *out)
+{
+    uint8_t  raw[SCREEN_RAW_MAX];
+    uint8_t *p = raw;
+    uint8_t *dlenpos;
+    uint16_t crc, nraw, wl, i;
+    static const uint8_t phy1[12] = {
+        0x01, 0x00,              /* DstAddr = 1 */
+        0x00, 0x80,              /* SrcAddr = 0x8000 */
+        0x00, 0x00, 0x00,        /* Reserved */
+        0x00,                    /* BarCodeOption = 0 */
+        0x00,                    /* CheckMode = 0 (CRC16) */
+        0x01,                    /* DisplayMode = 1 (动态) */
+        0xFE,                    /* DeviceType = 通配 */
+        0x02                     /* ProtocolVersion */
+    };
+
+    if (out == NULL || areas == NULL || n == 0 || n > 3) return 0;
+
+    memcpy(p, phy1, sizeof(phy1)); p += sizeof(phy1);
+    dlenpos = p; p += 2;                 /* DataLen 稍后回填 */
+
+    /* 命令 A3 06 */
+    *p++ = 0xA3;
+    *p++ = 0x06;
+    *p++ = 0x00;                         /* Response：0 不需回 */
+    *p++ = SCREEN_PROC_MODE;             /* ProcessMode */
+    *p++ = 0x00;                         /* Reserved（本命令仅 1 字节） */
+    *p++ = 0x00;                         /* DeleteAreaNum = 0 */
+    *p++ = n;                            /* AreaNum */
+
+    for (i = 0; i < n; i++) {
+        const Screen_Area_t *a = &areas[i];
+        uint16_t dataLen = (uint16_t)(SCREEN_FONT_ESC_LEN + a->len);
+        uint16_t areaLen = (uint16_t)(SCREEN_REGION_LEN + 4U + dataLen);
+
+        /* 区域数据长度（2 字节，小端） */
+        *p++ = (uint8_t)areaLen;
+        *p++ = (uint8_t)(areaLen >> 8);
+
+        /* ---- 区域头 23 字节 ---- */
+        *p++ = 0x00;                                     /* AreaType = 文本 */
+        *p++ = (uint8_t)(a->x & 0xFF);
+        *p++ = (uint8_t)(0x80 | (a->x >> 8));            /* X：像素单位 */
+        *p++ = (uint8_t)(a->y & 0xFF);
+        *p++ = (uint8_t)(a->y >> 8);
+        *p++ = (uint8_t)(a->w & 0xFF);
+        *p++ = (uint8_t)(0x80 | (a->w >> 8));            /* W：像素单位 */
+        *p++ = (uint8_t)(a->h & 0xFF);
+        *p++ = (uint8_t)(a->h >> 8);
+        *p++ = (uint8_t)i;                               /* DynamicAreaLoc 0/1/2 */
+        *p++ = 0x00;                                     /* Lines_sizes 行间距 */
+        *p++ = 0x01;                                     /* RunMode 停末页 */
+        *p++ = 0x00; *p++ = 0x00;                        /* Timeout */
+        *p++ = 0x00;                                     /* SoundMode 不语音 */
+        *p++ = 0x00;                                     /* ExtendParaLen */
+        *p++ = SCREEN_ALIGN_CENTER;                      /* TextAlignment 居中 */
+        *p++ = 0x01;                                     /* SingleLine 单行 */
+        *p++ = 0x01;                                     /* NewLine 不自动换行 */
+        *p++ = SCREEN_AREA_MODE_FIXED;                   /* DisplayMode */
+        *p++ = 0x00;                                     /* ExitMode */
+        *p++ = 0x00;                                     /* Speed */
+        *p++ = 0x00;                                     /* StayTime */
+
+        /* ---- 显示数据长度（4 字节，小端，含 \F 转义） ---- */
+        *p++ = (uint8_t)dataLen;
+        *p++ = (uint8_t)(dataLen >> 8);
+        *p++ = 0x00;
+        *p++ = 0x00;
+
+        /* ---- 显示数据：\F + 字库名(4) + 文本 ---- */
+        *p++ = 0x5C;                                     /* '\' */
+        *p++ = 'F';
+        memcpy(p, a->font, 4); p += 4;
+        if (a->len) { memcpy(p, a->text, a->len); p += a->len; }
     }
 
-    uint8_t raw[SCREEN_RAW_MAX];
-    uint8_t data[SCREEN_TEXT_MAX + SCREEN_FONT_ESC_LEN];
-    uint8_t *p = raw;
-    uint16_t crc, n, i, wire_len = 0;
-    uint16_t dlen = 0;
-    /* AreaType, X, Y, W, H, ID, spacing, RunMode, timeout, sound,
-       extension, alignment, SingleLine, NewLine, effect, exit, mode, stay. */
-    uint8_t region[] = {
-        0x00, 0x00, 0x80, 0x00, 0x00, 0x40, 0x80, 0x10, 0x00,
-        0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x01, 0x01, SCREEN_AREA_MODE_FIXED, 0x00, 0x00, 0x00
-    };
-    const uint8_t header[] = {
-        0x01, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x01, 0xFE, 0x02
-    };
-    const uint8_t command[] = {0xA3, 0x06, 0x00, 0x01, 0x00, 0x00, 0x01};
-
-    if (out == NULL || text == NULL || len == 0 || len > SCREEN_TEXT_MAX)
-        return 0;
-
-    /* Data = 字库转义 + GB2312文本：
-       "\F" + 中文字库名 + "\F" + 英文字库名 + text
-       协议 §11.1 要求显示数据前指定字库，否则用默认字库导致中文乱码。 */
-    data[dlen++] = 0x5C;                       /* '\' */
-    data[dlen++] = 'F';
-    memcpy(&data[dlen], SCREEN_FONT_NAME_CN, 4); dlen += 4;
-    data[dlen++] = 0x5C;
-    data[dlen++] = 'F';
-    memcpy(&data[dlen], SCREEN_FONT_NAME_EN, 4); dlen += 4;
-    memcpy(&data[dlen], text, len);              dlen += len;
-
-    memcpy(p, header, sizeof(header)); p += sizeof(header);
-    *p++ = (uint8_t)(36U + dlen); *p++ = 0;
-    memcpy(p, command, sizeof(command)); p += sizeof(command);
-    *p++ = (uint8_t)(27U + dlen); *p++ = 0;
-    memcpy(p, region, sizeof(region)); p += sizeof(region);
-    *p++ = (uint8_t)dlen; *p++ = 0; *p++ = 0; *p++ = 0;
-    memcpy(p, data, dlen); p += dlen;
+    /* 回填数据域长度（不含包头/包校验/帧尾/帧头） */
+    {
+        uint16_t domain = (uint16_t)(p - (raw + 14));
+        dlenpos[0] = (uint8_t)domain;
+        dlenpos[1] = (uint8_t)(domain >> 8);
+    }
 
     crc = Screen_CRC16(raw, (uint16_t)(p - raw));
-    *p++ = (uint8_t)crc; *p++ = (uint8_t)(crc >> 8);
-    n = (uint16_t)(p - raw);
+    *p++ = (uint8_t)crc;
+    *p++ = (uint8_t)(crc >> 8);
+    nraw = (uint16_t)(p - raw);
 
-    memset(out, 0xA5, 8); wire_len = 8;
-    for (i = 0; i < n; ++i) {
+    /* PHY0：8×0xA5 + 字符转义 + 0x5A */
+    memset(out, 0xA5, 8);
+    wl = 8;
+    for (i = 0; i < nraw; i++) {
         switch (raw[i]) {
-        case 0xA5: out[wire_len++] = 0xA6; out[wire_len++] = 0x02; break;
-        case 0xA6: out[wire_len++] = 0xA6; out[wire_len++] = 0x01; break;
-        case 0x5A: out[wire_len++] = 0x5B; out[wire_len++] = 0x02; break;
-        case 0x5B: out[wire_len++] = 0x5B; out[wire_len++] = 0x01; break;
-        default: out[wire_len++] = raw[i]; break;
+        case 0xA5: out[wl++] = 0xA6; out[wl++] = 0x02; break;
+        case 0xA6: out[wl++] = 0xA6; out[wl++] = 0x01; break;
+        case 0x5A: out[wl++] = 0x5B; out[wl++] = 0x02; break;
+        case 0x5B: out[wl++] = 0x5B; out[wl++] = 0x01; break;
+        default:   out[wl++] = raw[i]; break;
         }
     }
-    out[wire_len++] = 0x5A;
-    return wire_len;
+    out[wl++] = 0x5A;
+    return wl;
 }
 
-/* HAL_UART_Transmit waits for TC on success; its timeout bounds failure. */
+/* HAL_UART_Transmit 成功会等到 TC；超时只用于界定失败。三区域帧在 9600bps
+   下约 150~310ms，故给 1000ms。 */
 static void Screen_Send(const uint8_t *data, uint16_t len)
 {
     if (len == 0) return;
     HAL_GPIO_WritePin(T3_EN_GPIO_Port, T3_EN_Pin, GPIO_PIN_SET);
-    (void)HAL_UART_Transmit(&huart5, (uint8_t *)data, len, 300);
+    (void)HAL_UART_Transmit(&huart5, (uint8_t *)data, len, 1000);
     HAL_GPIO_WritePin(T3_EN_GPIO_Port, T3_EN_Pin, GPIO_PIN_RESET);
 }
 
-void Screen_ShowFixed(const uint8_t *text, uint16_t len)
+/* 显示第 idx 项（0..7）：名称 / 数值 / 单位 三区域一次下发 */
+void Screen_ShowItem(uint8_t idx)
 {
     static uint8_t frame[SCREEN_WIRE_MAX];
-    uint16_t flen = Build_FixedFrame(text, len, frame);
-    Screen_Send(frame, flen);
-}
+    const uint8_t *name = NM_TEMP;
+    uint16_t nlen = 4;
+    char val[16];
+    char uni[8];
+    uint16_t vlen = 0, ulen = 0;
+    uint8_t valid;
 
-/* 格式化温度文本: "温度:21.5℃" */
-void Screen_FormatTemp(uint8_t *out, uint16_t *out_len)
-{
-    /* "温度" GB2312 = CE C2 B6 C8 */
-    out[0] = 0xCE; out[1] = 0xC2;
-    out[2] = 0xB6; out[3] = 0xC8;
-    out[4] = 0x3A;  /* ':' */
-    if (g_env.ble_box_valid)
-        *out_len = (uint16_t)sprintf((char*)out + 5, "%d.%d",
-                                     (int)(g_env.air_temp),
-                                     (int)(g_env.air_temp * 10) % 10) + 5;
-    else
-        *out_len = (uint16_t)sprintf((char*)out + 5, "--.-") + 5;
-    /* "℃" = A1 E6 */
-    out[(*out_len)++] = 0xA1;
-    out[(*out_len)++] = 0xE6;
-}
+    val[0] = '\0';
+    uni[0] = '\0';
 
-/* 格式化湿度文本: "湿度:54.5%" */
-void Screen_FormatHumi(uint8_t *out, uint16_t *out_len)
-{
-    out[0] = 0xCA; out[1] = 0xAA;
-    out[2] = 0xB6; out[3] = 0xC8;
-    out[4] = 0x3A;
-    if (g_env.ble_box_valid)
-        *out_len = (uint16_t)sprintf((char*)out + 5, "%d.%d",
-                                     (int)(g_env.air_humi),
-                                     (int)(g_env.air_humi * 10) % 10) + 5;
-    else
-        *out_len = (uint16_t)sprintf((char*)out + 5, "--.-") + 5;
-    out[(*out_len)++] = 0x25;  /* '%' */
-}
+    switch (idx) {
+    case 0: /* 空气温度 */
+        name = NM_TEMP; nlen = 4;
+        valid = g_env.ble_box_valid;
+        vlen = valid ? fmt_f1(val, g_env.air_temp) : fmt_na(val);
+        strcpy(uni, U_TEMP); ulen = (uint16_t)strlen(uni);
+        break;
 
-/* 格式化CO2文本: "CO2:603" (单位 ppm 因64px单行放不下已省略) */
-void Screen_FormatCO2(uint8_t *out, uint16_t *out_len)
-{
-    out[0] = 0x43; out[1] = 0x4F; out[2] = 0x32;  /* "CO2" */
-    out[3] = 0x3A;  /* ':' */
-    if (g_env.ble_box_valid)
-        *out_len = (uint16_t)sprintf((char*)out + 4, "%d", (int)g_env.co2) + 4;
-    else
-        *out_len = (uint16_t)sprintf((char*)out + 4, "---") + 4;
-    /* 64px 单行放不下 "ppm"，CO2 单位在温室场景约定俗成，省略 */
-}
+    case 1: /* 空气湿度 */
+        name = NM_HUMI; nlen = 4;
+        valid = g_env.ble_box_valid;
+        vlen = valid ? fmt_f1(val, g_env.air_humi) : fmt_na(val);
+        strcpy(uni, U_RH); ulen = (uint16_t)strlen(uni);
+        break;
 
-/* 格式化光照文本: "光照:1375lx" */
-void Screen_FormatLux(uint8_t *out, uint16_t *out_len)
-{
-    out[0] = 0xB9; out[1] = 0xE2;  /* 光 */
-    out[2] = 0xD5; out[3] = 0xD5;  /* 照 */
-    out[4] = 0x3A;
-    if (g_env.ble_box_valid)
-        /* lux 为 uint32，按无符号打印，避免大光照时转 int 变负 */
-        *out_len = (uint16_t)sprintf((char*)out + 5, "%lu", (unsigned long)g_env.lux) + 5;
-    else
-        *out_len = (uint16_t)sprintf((char*)out + 5, "----") + 5;
-    out[(*out_len)++] = 0x4C;  /* L */
-    out[(*out_len)++] = 0x75;  /* u */
-    out[(*out_len)++] = 0x78;  /* x */
-}
+    case 2: /* CO2 */
+        name = NM_CO2; nlen = 3;
+        valid = g_env.ble_box_valid;
+        if (valid) vlen = (uint16_t)sprintf(val, "%lu", (unsigned long)(uint32_t)(g_env.co2 + 0.5f));
+        else       vlen = fmt_na(val);
+        strcpy(uni, U_PPM); ulen = (uint16_t)strlen(uni);
+        break;
 
-/* 格式化气压文本: "气压:101.6k" (kPa 缩写为 k，64px单行放不下完整单位) */
-void Screen_FormatPressure(uint8_t *out, uint16_t *out_len)
-{
-    out[0] = 0xC6; out[1] = 0xF8;  /* 气 */
-    out[2] = 0xD1; out[3] = 0xB9;  /* 压 */
-    out[4] = 0x3A;
-    if (g_env.ble_box_valid)
-        *out_len = (uint16_t)sprintf((char*)out + 5, "%d.%d",
-                                     (int)(g_env.pressure),
-                                     (int)(g_env.pressure * 10) % 10) + 5;
-    else
-        *out_len = (uint16_t)sprintf((char*)out + 5, "--.-") + 5;
-    out[(*out_len)++] = 0x6B;  /* k (kPa 缩写，64px 单行放不下完整 "kPa") */
-}
+    case 3: /* 光照 */
+        name = NM_LUX; nlen = 4;
+        valid = g_env.ble_box_valid;
+        if (!valid) {
+            vlen = fmt_na(val);
+            strcpy(uni, U_LX);
+        } else if (g_env.lux >= 1000000UL) {
+            /* 超 6 位 → 换 klx 并保留一位小数；仅影响显示，不改变采集/上传原值 */
+            vlen = fmt_f1(val, (float)g_env.lux / 1000.0f);
+            strcpy(uni, U_KLX);
+        } else {
+            vlen = (uint16_t)sprintf(val, "%lu", (unsigned long)g_env.lux);
+            strcpy(uni, U_LX);
+        }
+        ulen = (uint16_t)strlen(uni);
+        break;
 
-/* 格式化土壤温度: "土温:20.6℃" */
-void Screen_FormatSoilTemp(uint8_t *out, uint16_t *out_len)
-{
-    out[0] = 0xCD; out[1] = 0xC1;  /* 土 */
-    out[2] = 0xCE; out[3] = 0xC2;  /* 温 */
-    out[4] = 0x3A;
-    if (g_env.soil_valid)
-        *out_len = (uint16_t)sprintf((char*)out + 5, "%d.%d",
-                                     (int)(g_env.soil_temp),
-                                     (int)(g_env.soil_temp * 10) % 10) + 5;
-    else
-        *out_len = (uint16_t)sprintf((char*)out + 5, "--.-") + 5;
-    out[(*out_len)++] = 0xA1;
-    out[(*out_len)++] = 0xE6;  /* ℃ */
-}
+    case 4: /* 大气压 */
+        name = NM_PRES; nlen = 4;
+        valid = g_env.ble_box_valid;
+        vlen = valid ? fmt_f1(val, g_env.pressure) : fmt_na(val);
+        strcpy(uni, U_KPA); ulen = (uint16_t)strlen(uni);
+        break;
 
-/* 格式化土壤湿度: "土湿:45%" */
-void Screen_FormatSoilHumi(uint8_t *out, uint16_t *out_len)
-{
-    out[0] = 0xCD; out[1] = 0xC1;  /* 土 */
-    out[2] = 0xCA; out[3] = 0xAA;  /* 湿 */
-    out[4] = 0x3A;
-    if (g_env.soil_valid)
-        *out_len = (uint16_t)sprintf((char*)out + 5, "%d", (int)g_env.soil_humi) + 5;
-    else
-        *out_len = (uint16_t)sprintf((char*)out + 5, "--") + 5;
-    out[(*out_len)++] = 0x25;  /* % */
-}
+    case 5: /* 土壤温度 */
+        name = NM_STMP; nlen = 4;
+        valid = g_env.soil_valid;
+        vlen = valid ? fmt_f1(val, g_env.soil_temp) : fmt_na(val);
+        strcpy(uni, U_TEMP); ulen = (uint16_t)strlen(uni);
+        break;
 
-/* 格式化土壤EC: "EC:1200u" (µS 缩写为 u，64px单行放不下 us/cm) */
-void Screen_FormatEC(uint8_t *out, uint16_t *out_len)
-{
-    out[0] = 0x45; out[1] = 0x43;  /* "EC" */
-    out[2] = 0x3A;  /* ':' */
-    if (g_env.soil_valid)
-        *out_len = (uint16_t)sprintf((char*)out + 3, "%d", (int)g_env.soil_ec) + 3;
-    else
-        *out_len = (uint16_t)sprintf((char*)out + 3, "----") + 3;
-    out[(*out_len)++] = 0x75;  /* u (µS 缩写，64px 单行放不下 "us/cm") */
+    case 6: /* 土壤湿度 */
+        name = NM_SHUM; nlen = 4;
+        valid = g_env.soil_valid;
+        vlen = valid ? fmt_f1(val, g_env.soil_humi) : fmt_na(val);
+        strcpy(uni, U_PCT); ulen = (uint16_t)strlen(uni);
+        break;
+
+    case 7: /* 土壤电导 */
+        name = NM_EC; nlen = 4;
+        valid = g_env.soil_valid;
+        if (valid) vlen = (uint16_t)sprintf(val, "%lu", (unsigned long)(uint32_t)(g_env.soil_ec + 0.5f));
+        else       vlen = fmt_na(val);
+        strcpy(uni, U_EC); ulen = (uint16_t)strlen(uni);
+        break;
+
+    default:
+        return;
+    }
+
+    /* 超宽保护：>6 字符显示 ERR，不截断前后数字 */
+    if (vlen > SCREEN_VAL_MAX) { strcpy(val, "ERR"); vlen = 3; }
+    if (ulen > SCREEN_VAL_MAX) { strcpy(uni, "ERR"); ulen = 3; }
+
+    {
+        Screen_Area_t areas[3];
+        uint16_t flen;
+
+        /* 名称区：中文用中文字库，纯 ASCII（CO2）用英文字库 */
+        areas[0].x = AREA_NAME_X; areas[0].y = AREA_NAME_Y;
+        areas[0].w = AREA_NAME_W; areas[0].h = AREA_NAME_H;
+        areas[0].font = (name[0] < 0x80) ? SCREEN_FONT_NAME_EN : SCREEN_FONT_NAME_CN;
+        areas[0].text = name; areas[0].len = nlen;
+
+        /* 数值区 */
+        areas[1].x = AREA_VAL_X; areas[1].y = AREA_VAL_Y;
+        areas[1].w = AREA_VAL_W; areas[1].h = AREA_VAL_H;
+        areas[1].font = SCREEN_FONT_NAME_EN;
+        areas[1].text = (const uint8_t *)val; areas[1].len = vlen;
+
+        /* 单位区 */
+        areas[2].x = AREA_UNI_X; areas[2].y = AREA_UNI_Y;
+        areas[2].w = AREA_UNI_W; areas[2].h = AREA_UNI_H;
+        areas[2].font = SCREEN_FONT_NAME_EN;
+        areas[2].text = (const uint8_t *)uni; areas[2].len = ulen;
+
+        flen = Screen_BuildFrame(areas, 3, frame);
+        Screen_Send(frame, flen);
+    }
 }

@@ -1,7 +1,7 @@
 /**
   ******************************************************************************
   * @file    screen.h
-  * @brief   BX-5K1 LED大屏驱动接口
+  * @brief   BX-5K1 LED 大屏驱动接口
   ******************************************************************************
   */
 #ifndef __SCREEN_H
@@ -9,17 +9,9 @@
 
 #include "app_def.h"
 
-/* 上屏一条单行固定文本（不滚动，由 app.c 定时切换下一条） */
-void Screen_ShowFixed(const uint8_t *text, uint16_t len);
-
-/* 格式化8条轮播文本 */
-void Screen_FormatTemp(uint8_t *out, uint16_t *out_len);
-void Screen_FormatHumi(uint8_t *out, uint16_t *out_len);
-void Screen_FormatCO2(uint8_t *out, uint16_t *out_len);
-void Screen_FormatLux(uint8_t *out, uint16_t *out_len);
-void Screen_FormatPressure(uint8_t *out, uint16_t *out_len);
-void Screen_FormatSoilTemp(uint8_t *out, uint16_t *out_len);
-void Screen_FormatSoilHumi(uint8_t *out, uint16_t *out_len);
-void Screen_FormatEC(uint8_t *out, uint16_t *out_len);
+/* 显示第 idx 项指标（0..7）：
+ *   左侧中文名称(X0,Y2,24×12) + 右上数值(X26,Y0,38×8) + 右下单位(X26,Y8,38×8)
+ *   由 app.c 每 8 秒切换下一项。 */
+void Screen_ShowItem(uint8_t idx);
 
 #endif
