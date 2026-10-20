@@ -22,6 +22,17 @@
 #define SCREEN_FONT_CN_H   10
 #define SCREEN_WIDTH_PX    64      /* BX-5K1 物理宽度 64×16 */
 
+/* 字库名（协议 §11.1：区域 Data 前必须用 "\F"+字库名 指定字库，否则控制器用默认字库；
+   用户下载过自定义字库后，默认字库槽数据不匹配 → 中文按错误字模取点阵 = 乱码）。
+   标准字库名：O000=16点阵中文 O001=24点阵 O002=32点阵；E000=16点阵英文 …
+   自定义 10×10 中文 / 6×6 英文：填仰邦字库工具里显示的“字库名”（O 开头/ E 开头各 4 位）。
+   若不确定，先用 O000 / E000（出厂标准）验证：中文能正常认出即证明是字库选择问题。 */
+#define SCREEN_FONT_NAME_CN  "O000"   /* 中文字库名（自定义 10×10 时改成实际名，如 O008） */
+#define SCREEN_FONT_NAME_EN  "E000"   /* 英文字库名（自定义 6×6 时改成实际名，如 E006） */
+
+/* 字库转义前缀："\F"+4位字库名，中英各一个 = 12 字节 */
+#define SCREEN_FONT_ESC_LEN 12U
+
 /* 区域显示模式：00=单行静止（需求：不做滚动）；03=左移（原滚动效果，已弃用） */
 #define SCREEN_AREA_MODE_FIXED    0x00
 #define SCREEN_AREA_MODE_LSCROLL  0x03
@@ -52,7 +63,7 @@ static uint16_t Screen_CRC16(const uint8_t *data, uint16_t len)
  */
 /* Maximum text supplied by the application; allow worst-case wire escaping. */
 #define SCREEN_TEXT_MAX 32U
-#define SCREEN_RAW_MAX  (14U + 36U + SCREEN_TEXT_MAX + 2U)
+#define SCREEN_RAW_MAX  (14U + 36U + SCREEN_TEXT_MAX + SCREEN_FONT_ESC_LEN + 2U)
 #define SCREEN_WIRE_MAX (8U + 2U * SCREEN_RAW_MAX + 1U)
 
 /* 估算 GB2312 文本像素宽度（中文=SCREEN_FONT_CN_W，英文=SCREEN_FONT_EN_W），用于静态单行防溢出 */
@@ -76,8 +87,10 @@ static uint16_t Build_FixedFrame(const uint8_t *text, uint16_t text_len, uint8_t
     }
 
     uint8_t raw[SCREEN_RAW_MAX];
+    uint8_t data[SCREEN_TEXT_MAX + SCREEN_FONT_ESC_LEN];
     uint8_t *p = raw;
     uint16_t crc, n, i, wire_len = 0;
+    uint16_t dlen = 0;
     /* AreaType, X, Y, W, H, ID, spacing, RunMode, timeout, sound,
        extension, alignment, SingleLine, NewLine, effect, exit, mode, stay. */
     uint8_t region[] = {
@@ -94,13 +107,24 @@ static uint16_t Build_FixedFrame(const uint8_t *text, uint16_t text_len, uint8_t
     if (out == NULL || text == NULL || len == 0 || len > SCREEN_TEXT_MAX)
         return 0;
 
+    /* Data = 字库转义 + GB2312文本：
+       "\F" + 中文字库名 + "\F" + 英文字库名 + text
+       协议 §11.1 要求显示数据前指定字库，否则用默认字库导致中文乱码。 */
+    data[dlen++] = 0x5C;                       /* '\' */
+    data[dlen++] = 'F';
+    memcpy(&data[dlen], SCREEN_FONT_NAME_CN, 4); dlen += 4;
+    data[dlen++] = 0x5C;
+    data[dlen++] = 'F';
+    memcpy(&data[dlen], SCREEN_FONT_NAME_EN, 4); dlen += 4;
+    memcpy(&data[dlen], text, len);              dlen += len;
+
     memcpy(p, header, sizeof(header)); p += sizeof(header);
-    *p++ = (uint8_t)(36U + len); *p++ = 0;
+    *p++ = (uint8_t)(36U + dlen); *p++ = 0;
     memcpy(p, command, sizeof(command)); p += sizeof(command);
-    *p++ = (uint8_t)(27U + len); *p++ = 0;
+    *p++ = (uint8_t)(27U + dlen); *p++ = 0;
     memcpy(p, region, sizeof(region)); p += sizeof(region);
-    *p++ = (uint8_t)len; *p++ = 0; *p++ = 0; *p++ = 0;
-    memcpy(p, text, len); p += len;
+    *p++ = (uint8_t)dlen; *p++ = 0; *p++ = 0; *p++ = 0;
+    memcpy(p, data, dlen); p += dlen;
 
     crc = Screen_CRC16(raw, (uint16_t)(p - raw));
     *p++ = (uint8_t)crc; *p++ = (uint8_t)(crc >> 8);
