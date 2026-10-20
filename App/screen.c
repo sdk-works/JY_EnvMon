@@ -65,7 +65,23 @@
 #define SCREEN_FONT_ESC_LEN   6U      /* "\F" + 4 位字库名 */
 
 /* ===== 单位（全部 ASCII，走英文字库；单位区高 8px） ===== */
-#define U_TEMP   "C"       /* 测试用 ASCII C；做好 8px 高 ℃ 字模后可改回 ℃（需走中文字库） */
+/* 温度单位说明：
+   ℃ 在 GB2312 里是 A1E6、单独的 ° 是 A1E3，都属于全角中文符号区，只有 12×12
+   中文字库里有，塞不进 8px 高的单位区；而 ASCII 里没有 ° 字符。
+   所以“把 ℃ 拆成 ° + C”并不能解决问题——° 本身同样只有中文字库里才有。
+   想显示 °C，用下面这个开关：
+     SCREEN_TEMP_UNIT_MODE = 0 → 直接显示 "C"（默认，零额外字库，语义上即摄氏度）
+     SCREEN_TEMP_UNIT_MODE = 1 → 显示 "°C"：需在英文字库 E000 里把 SCREEN_DEG_CHAR
+                                 这个码位的字形改成 °，两个字符都是 6×8，同字库同区域，
+                                 高度天然一致，不会出现基线不齐。 */
+#define SCREEN_TEMP_UNIT_MODE   0
+#define SCREEN_DEG_CHAR         "^"    /* 承载 ° 的 ASCII 码位(0x5E)，请在字库里改它的字形 */
+
+#if SCREEN_TEMP_UNIT_MODE
+  #define U_TEMP  SCREEN_DEG_CHAR "C"
+#else
+  #define U_TEMP  "C"
+#endif
 #define U_RH     "%RH"
 #define U_PPM    "ppm"
 #define U_LX     "lx"
