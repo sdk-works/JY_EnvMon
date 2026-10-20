@@ -3,11 +3,13 @@
   * @file    screen.c
   * @brief   BX-5K1 LED 大屏驱动：左中文名称 + 右上数值 + 右下单位（三区域单帧）
   *
-  * 布局（物理 64×16 像素，每次整屏只显示一项指标，8 秒切换）：
-  *   名称区  X=0 , Y=2 , W=24, H=12   两个 12×12 汉字（CO2 用 6×8 英文）
-  *   数值区  X=26, Y=0 , W=38, H=8    最多 6 个 6×8 ASCII 字符
-  *   单位区  X=26, Y=8 , W=38, H=8    最多 6 个 6×8 ASCII 字符
-  *   左右间隔 2 像素；名称区 Y=2 使 12px 字落在 16px 屏正中。
+ * 布局（物理 64×16 像素，每次整屏只显示一项指标，8 秒切换）：
+ *   名称区  X=0 , Y=2 , W=24, H=12   两个 12×12 汉字（CO2 用英文小字）
+ *   数值区  X=26, Y=0 , W=38, H=8    数值字库（默认 6×8，可切 7×8），最多 5~6 字符
+ *   单位区  X=26, Y=8 , W=38, H=8    固定 6×8，最多 6 字符
+ *   数值与单位都水平居中于同一竖线（X 中心 = 26 + 38/2 = 45），视觉上成一列。
+ *   左右间隔 2 像素；名称区 Y=2 使 12px 字落在 16px 屏正中。
+ *   精度：温度/湿度/气压固定 1 位小数；土湿、CO2、EC 为整数。
   *
   * 温度单位 = "°C"：同一单位区内先切中文字库输出 °(A1E3)，再切英文字库输出 C。
   *   协议允许在内容中间用 \F 反复切换字库，因此一个区域可混用不同字库。
@@ -51,9 +53,6 @@
 #define AREA_UNI_W         38
 #define AREA_UNI_H          8
 
-/* 单个区域最多字符数：38px / 6px = 6 */
-#define SCREEN_VAL_MAX      6
-
 /* ===== 区域显示参数 ===== */
 /* DisplayMode：本机实测 0x00 为静止（协议标称 0x01=静止，如需可改 0x01） */
 #define SCREEN_AREA_MODE_FIXED  0x00
@@ -63,9 +62,27 @@
 #define SCREEN_ALIGN_CENTER     0x0A   /* 水平居中 + 垂直居中 */
 
 /* ===== 字库名（须与控制器内实际下载的字库名一致） ===== */
-#define SCREEN_FONT_NAME_CN  "O000"   /* 12×12 中文 */
-#define SCREEN_FONT_NAME_EN  "E000"   /* 6×8  英文/数字 */
+#define SCREEN_FONT_NAME_CN  "O000"   /* 12×12 中文（字号 9） */
+#define SCREEN_FONT_NAME_EN  "E000"   /* 6×8  英文/单位 */
 #define SCREEN_FONT_ESC_LEN   6U      /* "\F" + 4 位字库名 */
+
+/* ===== 数值字库 / 每区最大字符数 =====
+ * 右区可用宽 38px，区域不做额外字间距（协议无「字间距」字段，字符步进 = 字框宽度）：
+ *   6×8 → 38/6 = 6 字符；7×8 → 38/7 = 5 字符。
+ * 数值用 7×8 数字点阵更清晰，但需在仰邦工具里另做 E001（宽7 高8）。
+ * 未做 E001 前保持 0（沿用 E000 6×8），否则数值区会空白。 */
+#define SCREEN_USE_7x8_NUM      0
+#if SCREEN_USE_7x8_NUM
+  #define SCREEN_FONT_NAME_NUM  "E001"
+  #define SCREEN_NUM_FONT_W     7
+  #define SCREEN_VAL_MAX        5      /* 38px / 7px = 5，如 101.4 / -10.5 / 65535 */
+  #define SCREEN_LUX_KLX_MIN    100000UL   /* 6 位放不下，≥1e5 lux 转 klx */
+#else
+  #define SCREEN_FONT_NAME_NUM  SCREEN_FONT_NAME_EN
+  #define SCREEN_NUM_FONT_W     6
+  #define SCREEN_VAL_MAX        6      /* 38px / 6px = 6 */
+  #define SCREEN_LUX_KLX_MIN    1000000UL
+#endif
 
 /* ===== 单位 ===== */
 /* 温度单位 = °(中文字库) + C(英文字库) 拼接，同一单位区内中途切换 \F：
@@ -84,7 +101,16 @@ static const uint8_t U_C  [] = {'C'};          /* C ASCII（英文字库） */
 #define U_KLX    "klx"
 #define U_KPA    "kPa"
 #define U_PCT    "%"
-#define U_EC     "uS/cm"
+
+/* 电导单位：正确物理量是 µS/cm（不能缩成 µS / uS，否则物理量变了）。
+ * µ(0xB5) 不在 ASCII 里，需在 6×8 英文字库里做该字形；未做时用兼容写法 uS/cm。
+ * 6×8 下 5 字符 = 30px，38px 区余 8px，绝不裁切；7×8 下 35px，余 3px。 */
+#define SCREEN_EC_USE_MICRO   0
+#if SCREEN_EC_USE_MICRO
+  #define U_EC  "\xB5" "S/cm"   /* 拆成两个字面量，避免 \xB5S 被当成一个转义 */
+#else
+  #define U_EC  "uS/cm"
+#endif
 
 /* ===== 缓冲尺寸 ===== */
 #define SCREEN_AREA_DATA_MAX  20U   /* 每区域数据上限：\F 各段之和 */
@@ -316,7 +342,7 @@ void Screen_ShowItem(uint8_t idx)
         if (!valid) {
             vlen = fmt_na(val);
             strcpy(uni, U_LX);
-        } else if (g_env.lux >= 1000000UL) {
+        } else if (g_env.lux >= SCREEN_LUX_KLX_MIN) {
             /* 超 6 位 → 换 klx 并保留一位小数；仅影响显示，不改变采集/上传原值 */
             vlen = fmt_f1(val, (float)g_env.lux / 1000.0f);
             strcpy(uni, U_KLX);
@@ -341,10 +367,11 @@ void Screen_ShowItem(uint8_t idx)
         temp_unit = 1;
         break;
 
-    case 6: /* 土壤湿度 */
+    case 6: /* 土壤湿度：传感器本身就是整数百分比，不再补 .0 造成假精度 */
         name = NM_SHUM; nlen = 4;
         valid = g_env.soil_valid;
-        vlen = valid ? fmt_f1(val, g_env.soil_humi) : fmt_na(val);
+        if (valid) vlen = (uint16_t)sprintf(val, "%lu", (unsigned long)(uint32_t)(g_env.soil_humi + 0.5f));
+        else       vlen = fmt_na(val);
         strcpy(uni, U_PCT); ulen = (uint16_t)strlen(uni);
         break;
 
@@ -370,10 +397,10 @@ void Screen_ShowItem(uint8_t idx)
     areas[0].w = AREA_NAME_W; areas[0].h = AREA_NAME_H;
     areas[0].len = Screen_Seg(areas[0].data, name_font, name, nlen);
 
-    /* ---- 数值区：英文字库 ---- */
+    /* ---- 数值区：数值字库（默认 6×8，可切 7×8） ---- */
     areas[1].x = AREA_VAL_X; areas[1].y = AREA_VAL_Y;
     areas[1].w = AREA_VAL_W; areas[1].h = AREA_VAL_H;
-    areas[1].len = Screen_Seg(areas[1].data, SCREEN_FONT_NAME_EN, (const uint8_t *)val, vlen);
+    areas[1].len = Screen_Seg(areas[1].data, SCREEN_FONT_NAME_NUM, (const uint8_t *)val, vlen);
 
     /* ---- 单位区 ---- */
     areas[2].x = AREA_UNI_X; areas[2].y = AREA_UNI_Y;
