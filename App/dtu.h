@@ -57,7 +57,13 @@ uint32_t Dtu_DroppedCount(void);
 uint32_t Dtu_LastBootId(void);
 
 /* 身份层状态：1=本次 boot_id 已成功落盘并校验，允许生成新记录；
-   0=身份存储故障（禁止新建/上传新数据，仅补传已持久化旧记录）。 */
+   0=身份存储故障/损坏（禁止新建数据，仅补传已持久化旧记录）。 */
 uint8_t Dtu_IdentityOk(void);
+
+/* 存储层状态：1=数据区初始化成功（可追加）；0=初始化失败（禁止写入） */
+uint8_t Dtu_StorageOk(void);
+
+/* 64 位运行时长（ms），抗 HAL_GetTick 32 位回绕 */
+uint64_t Dtu_UptimeMs(void);
 
 #endif /* __DTU_H */

@@ -59,6 +59,13 @@ static uint32_t s_boot_id = 0;
 static uint32_t s_generation = 0;
 static uint32_t s_dropped = 0;
 
+/* 身份状态：区分"首次使用"与"元数据损坏" */
+static FS_IdentState_t s_ident_state = FS_IDENT_UNKNOWN;
+
+/* 数据区就绪标志：初始化失败（擦除/写头/回读不通过）时保持 false，
+   禁止 FS_Append/FS_Recycle 继续写入无有效扇区头的区域。 */
+static bool s_data_ready = false;
+
 /* 活动数据扇区：当前写入/读取的扇区地址与代次 */
 static uint32_t s_act_data_addr = 0;   /* 当前活动数据扇区基址 */
 static uint32_t s_act_data_gen = 0;
@@ -99,14 +106,15 @@ static void FS_PackRecord(const FS_Record_t *r, uint8_t out[FLASH_STORE_REC_SIZE
     out[20] = r->time_quality;
     out[21] = r->valid;
     memcpy(&out[22], r->data, FS_CH_NUM * 4);   /* 32B */
-    out[54] = (r->confirmed) ? 0x00 : 0xFF;     /* 已确认标志：待发=FF */
-    out[55] = 0xFF;                              /* 提交标识：写入完成时置0 */
+    out[54] = 0xFF;                              /* 保留（旧固件的确认位，新固件不用） */
+    out[55] = 0x00;                              /* 提交标识：与数据同批一次写成，不二次编程 */
     /* CRC 只覆盖不变数据区 [0..53]（状态字节[54][55] 是可变的，排除）
        契约 v1.2 §10.4：改状态不破坏原 CRC */
     uint16_t crc = Modbus_CRC16(out, 54);
     out[56] = crc & 0xFF;
     out[57] = (crc >> 8) & 0xFF;
-    /* [58..63] 保留 0xFF */
+    /* [58..63] 保留 0xFF：其中 [60..63] 是独立"确认字"，
+       写入时保持擦除态（跳过编程），等 ACK 到达再一次性编程为 0。 */
 }
 
 /* 解包 + 校验 CRC */
@@ -125,7 +133,11 @@ static int FS_UnpackRecord(const uint8_t in[FLASH_STORE_REC_SIZE], FS_Record_t *
     r->time_quality = in[20];
     r->valid     = in[21];
     memcpy(r->data, &in[22], FS_CH_NUM * 4);
-    r->confirmed = (in[54] != 0xFF);      /* 非FF = 已确认 */
+    /* 已确认判定：新格式看独立确认字[60..63]==0x00000000；
+       旧格式（[54] 被编程为 0x00）依然兼容读出为已确认。 */
+    uint32_t confirm_word;
+    memcpy(&confirm_word, &in[60], 4);
+    r->confirmed = (in[54] != 0xFF) || (confirm_word == 0x00000000u);
     return 0;
 }
 
@@ -153,8 +165,8 @@ static int FS_ProgWord(uint32_t addr, uint32_t val)
     return (st == HAL_OK) ? 0 : -1;
 }
 
-/* 写一条记录到数据扇区（addr 起，64B）。写数据+CRC，最后写提交标识。
-   返回 0 成功，-1 任一 word 写入失败（调用方需回读校验）。 */
+/* 写一条记录到数据扇区（addr 起，64B）。单次成型，不做二次编程。
+   返回 0 成功，-1 任一 word 写入失败或目标 word 非擦除态（调用方需回读校验）。 */
 static int FS_WriteRecordToFlash(uint32_t addr, const FS_Record_t *r)
 {
     uint8_t buf[FLASH_STORE_REC_SIZE];
@@ -164,14 +176,15 @@ static int FS_WriteRecordToFlash(uint32_t addr, const FS_Record_t *r)
     for (int i = 0; i < FLASH_STORE_REC_SIZE / 4; i++) {
         uint32_t val;
         memcpy(&val, &buf[i*4], 4);
+        /* 全 0xFF 的 word 保持擦除态、不编程：留给后续单独编程
+           （记录尾部的确认字），也避免无意义的编程操作。 */
+        if (val == 0xFFFFFFFFu) continue;
+        /* 目标 word 必须是擦除态，否则同 word 二次编程在 F4 上会报错/写坏 */
+        if (*(volatile uint32_t *)(addr + i*4) != 0xFFFFFFFFu) { rc = -1; continue; }
         if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + i*4, val) != HAL_OK) rc = -1;
     }
     HAL_FLASH_Lock();
-    if (rc != 0) return -1;
-    /* 提交标识 [55]→0（word@addr+52 = 字节52,53,54,55，[55]是最高字节）
-       小端：0x00FFFFFF = [52..54]保持FF, [55]=00 */
-    if (FS_ProgWord(addr + 52, 0x00FFFFFF) != 0) return -1;
-    return 0;
+    return rc;
 }
 
 /* 读数据扇区头 */
@@ -234,15 +247,22 @@ static int32_t FS_CopyPendingTo(uint32_t target_base, uint32_t new_gen)
                                                               : FLASH_STORE_SECTOR_DATA_B;
     if (FS_EraseSector(target_sector) != 0) return -1;
 
-    /* 写新头（代次+1，committed 暂为未完成） */
+    /* 扇区头：magic/generation/used 各编程一次；committed 保持擦除态
+       （0xFFFFFFFF = 未完成），迁移全部成功后再一次性编程为 0。
+       原实现先写 0xFFFFFFFF 再写 0，等于对同一 word 二次编程。 */
     FS_DataHdr_t hdr;
     hdr.magic = FS_MAGIC;
     hdr.generation = new_gen;
-    hdr.committed = 0xFFFFFFFF;   /* 未完成 */
+    hdr.committed = 0xFFFFFFFF;   /* 未完成（擦除态，不编程） */
     hdr.used = s_q_count;
+
+    /* 先确认四个头 word 都处于擦除态，否则说明擦除未生效，拒绝继续写 */
+    for (int i = 0; i < 4; i++) {
+        if (*(volatile uint32_t *)(target_base + i*4) != 0xFFFFFFFFu) return -1;
+    }
+
     if (FS_ProgWord(target_base + 0,  hdr.magic) != 0) return -1;
     if (FS_ProgWord(target_base + 4,  hdr.generation) != 0) return -1;
-    if (FS_ProgWord(target_base + 8,  hdr.committed) != 0) return -1;
     if (FS_ProgWord(target_base + 12, hdr.used) != 0) return -1;
 
     /* 扇区头回读校验（原实现只校验记录、未校验头） */
@@ -296,30 +316,18 @@ static uint32_t FS_MaxBootInSector(uint32_t base, uint32_t cap)
     return boot;
 }
 
-/* 读取持久 boot_id：两元数据扇区所有槽中，取 CRC 有效且 boot_id 最大的。
-   追加写布局：每条32B = [0..3]boot_id [4..7]generation [8..9]crc16(覆盖[0..7]) [10..31]填充 */
-static uint32_t FS_LoadBootId(void)
+/* 判断元数据扇区是否处于擦除态（全部槽首 word 为 0xFFFFFFFF）。
+   用于区分"首次使用（空白）"与"有内容但无效（损坏）"。 */
+static int FS_MetaBlank(uint32_t base, uint32_t cap)
 {
-    uint32_t boot = 0;
-    const uint32_t addrs[2] = { FS_SECTOR4_ADDR, FS_SECTOR7_ADDR };
-    for (int s = 0; s < 2; s++) {
-        uint32_t base = addrs[s];
-        uint32_t cap  = (s == 0) ? FS_META_CAP_A : FS_META_CAP_B;
-        for (uint32_t k = 0; k < cap; k++) {
-            uint32_t addr = base + k * FS_META_REC_SIZE;
-            uint32_t b = *(volatile uint32_t*)addr;
-            if (b == 0xFFFFFFFF) break;   /* 空槽，之后也是空的 */
-            uint32_t g = *(volatile uint32_t*)(addr + 4);
-            uint16_t crc = Modbus_CRC16((const uint8_t*)addr, 8);
-            uint16_t stored = *(volatile uint16_t*)(addr + 8);
-            if (crc == stored && b > boot) boot = b;
-            (void)g;
-        }
+    for (uint32_t k = 0; k < cap; k++) {
+        if (*(volatile uint32_t *)(base + k * FS_META_REC_SIZE) != 0xFFFFFFFFu) return 0;
     }
-    return boot;
+    return 1;
 }
 
 /* 追加写一个 boot_id 到指定元数据扇区；返回写入槽序号，满/失败返回-1。
+   追加写布局：每条32B = [0..3]boot_id [4..7]generation [8..9]crc16(覆盖[0..7]) [10..31]填充
    写入后回读 boot_id/generation/CRC 三项，全部一致才算成功。 */
 static int FS_MetaAppend(uint32_t base, uint32_t cap, uint32_t boot, uint32_t gen)
 {
@@ -348,14 +356,34 @@ static int FS_MetaAppend(uint32_t base, uint32_t cap, uint32_t boot, uint32_t ge
 
 /* ====== 公开接口 ====== */
 
-void FS_Init(void)
+FS_Err_t FS_Init(void)
 {
     s_boot_id = 0;
     s_dropped = 0;
+    s_data_ready = false;
+    s_used = 0;
+    s_q_count = 0;
+    s_act_data_addr = 0;
+    s_act_data_gen = 0;
+    s_generation = 0;
 
-    /* 恢复 boot_id */
-    s_boot_id = FS_LoadBootId();
-    if (s_boot_id == 0) s_boot_id = 1;   /* 首次上电（注意：NextBootId 会再+1） */
+    /* 恢复 boot_id，并区分三种情形：
+       - 存在 CRC 有效的编号 → 正常恢复；
+       - 两扇区均空白        → 首次使用，编号从 1 开始；
+       - 有内容但无有效编号  → 身份损坏，禁止自动从 1 重新编号（会撞云端历史）。 */
+    uint32_t max_a = FS_MaxBootInSector(FS_SECTOR4_ADDR, FS_META_CAP_A);
+    uint32_t max_b = FS_MaxBootInSector(FS_SECTOR7_ADDR, FS_META_CAP_B);
+    if (max_a > 0 || max_b > 0) {
+        s_boot_id = (max_a > max_b) ? max_a : max_b;
+        s_ident_state = FS_IDENT_OK;
+    } else if (FS_MetaBlank(FS_SECTOR4_ADDR, FS_META_CAP_A) &&
+               FS_MetaBlank(FS_SECTOR7_ADDR, FS_META_CAP_B)) {
+        s_boot_id = 0;                       /* 首次使用 */
+        s_ident_state = FS_IDENT_BLANK;
+    } else {
+        s_boot_id = 0;                       /* 身份不可确认 */
+        s_ident_state = FS_IDENT_CORRUPT;
+    }
 
     /* 选择数据活动扇区：两个扇区头中代次最新且已提交的 */
     FS_DataHdr_t h5, h6;
@@ -382,23 +410,30 @@ void FS_Init(void)
         s_act_data_addr = FS_SECTOR5_ADDR;
         s_act_data_gen  = 1;
         if (FS_EraseSector(FLASH_STORE_SECTOR_DATA_A) != 0) {
-            /* 擦除失败：不假装已初始化，置空队列（上层将无记录可发） */
+            /* 擦除失败：不假装已初始化，置空队列并保持"未就绪"（上层将无记录可发） */
             s_generation = s_act_data_gen;
             s_used = 0;
             s_q_count = 0;
-            return;
+            return FS_ERR_NOTREADY;
         }
         FS_DataHdr_t h; h.magic=FS_MAGIC; h.generation=1; h.committed=0; h.used=0;
         if (FS_ProgWord(s_act_data_addr+0, h.magic) != 0 ||
             FS_ProgWord(s_act_data_addr+4, h.generation) != 0 ||
-            FS_ProgWord(s_act_data_addr+8, h.committed) != 0 ||
             FS_ProgWord(s_act_data_addr+12, h.used) != 0 ||
             *(volatile uint32_t*)(s_act_data_addr+0) != FS_MAGIC ||
-            *(volatile uint32_t*)(s_act_data_addr+8) != 0) {
+            *(volatile uint32_t*)(s_act_data_addr+12) != h.used) {
             s_generation = s_act_data_gen;
             s_used = 0;
             s_q_count = 0;
-            return;
+            return FS_ERR_NOTREADY;
+        }
+        /* 扇区头提交标识：擦除后即 0xFFFFFFFF，只编程这一次 */
+        if (FS_ProgWord(s_act_data_addr+8, 0u) != 0 ||
+            *(volatile uint32_t*)(s_act_data_addr+8) != 0u) {
+            s_generation = s_act_data_gen;
+            s_used = 0;
+            s_q_count = 0;
+            return FS_ERR_NOTREADY;
         }
     }
     s_generation = s_act_data_gen;
@@ -408,12 +443,38 @@ void FS_Init(void)
 
     /* 载入待发记录 */
     FS_LoadDataSector(s_act_data_addr, s_used);
+
+    s_data_ready = true;      /* 只有走到这里才允许追加/回收 */
+    return FS_OK;
+}
+
+FS_IdentState_t FS_IdentityState(void) { return s_ident_state; }
+
+bool FS_IdentityRepair(uint32_t min_boot_id)
+{
+    if (min_boot_id == 0xFFFFFFFFu) return false;   /* 上溢保护 */
+    uint32_t nb = min_boot_id + 1;
+
+    /* 先擦 A 并写入新编号，再处理 B：任一步掉电都至少保留一份有效编号 */
+    if (FS_EraseSector(FLASH_STORE_SECTOR_META_A) != 0) return false;
+    if (FS_MetaAppend(FS_SECTOR4_ADDR, FS_META_CAP_A, nb, s_generation) < 0) return false;
+
+    if (FS_EraseSector(FLASH_STORE_SECTOR_META_B) == 0) {
+        (void)FS_MetaAppend(FS_SECTOR7_ADDR, FS_META_CAP_B, nb, s_generation);
+    }
+
+    s_boot_id = nb;
+    s_ident_state = FS_IDENT_OK;
+    return true;
 }
 
 uint32_t FS_GetBootId(void) { return s_boot_id; }
 
 uint32_t FS_NextBootId(void)
 {
+    /* 身份损坏：禁止自动重新编号（否则可能与云端历史 msg_id 撞号） */
+    if (s_ident_state == FS_IDENT_CORRUPT) return 0;
+
     uint32_t new_boot = s_boot_id + 1;
     uint32_t gen = s_generation;
 
@@ -449,6 +510,9 @@ uint32_t FS_NextBootId(void)
 
 FS_Err_t FS_Append(const FS_Record_t *rec)
 {
+    /* 数据区未就绪：禁止写入（否则会写进无有效扇区头的区域，重启后无法恢复） */
+    if (!s_data_ready) return FS_ERR_NOTREADY;
+
     if (s_q_count >= FS_RAM_CAP) {
         /* 队列满：丢弃最旧未确认记录并计数（契约 §10.7） */
         s_dropped++;
@@ -495,10 +559,15 @@ void FS_MarkConfirmed(uint32_t boot_id, uint32_t seq)
         if (s_queue[i].boot_id == boot_id && s_queue[i].seq == seq) {
             uint32_t addr = s_act_data_addr + FLASH_STORE_SECTOR_HDR
                           + s_queue[i].slot * FLASH_STORE_REC_SIZE;
-            if (FS_ProgWord(addr + 52, 0xFF00FFFF) == 0) { /* [54]→0（字节2），确认 */
-                /* 回读：确认位[54]==0 且 提交位[55]==0 才算确认成功 */
-                const volatile uint8_t *p = (const volatile uint8_t *)addr;
-                if (p[54] == 0x00 && p[55] == 0x00) {
+            /* 确认字独占 [60..63]，只编程这一次（0xFFFFFFFF→0），不动其余字节。
+               编程前必须是擦除态，否则说明该 word 已编程过（重复 ACK / 旧格式），
+               直接跳过，避免 F4 上对同一 word 二次编程。 */
+            if (*(volatile uint32_t *)(addr + 60) == 0xFFFFFFFFu &&
+                FS_ProgWord(addr + 60, 0x00000000u) == 0) {
+                uint32_t cw;
+                memcpy(&cw, (const void *)(addr + 60), 4);
+                if (cw == 0x00000000u &&
+                    *(const volatile uint8_t *)(addr + 55) == 0x00) {
                     s_queue[i].confirmed = 1;
                 }
             }
@@ -544,11 +613,32 @@ bool FS_PeekLatest(FS_Record_t *rec)
     return true;
 }
 
+bool FS_ReadById(uint32_t boot_id, uint32_t seq, FS_Record_t *rec)
+{
+    for (uint32_t i = 0; i < s_q_count; i++) {
+        if (s_queue[i].boot_id == boot_id && s_queue[i].seq == seq) {
+            uint32_t addr = s_act_data_addr + FLASH_STORE_SECTOR_HDR
+                          + s_queue[i].slot * FLASH_STORE_REC_SIZE;
+            if (FS_UnpackRecord((const uint8_t*)addr, rec) != 0) {
+                /* 记录损坏：从队列移除，避免反复取到坏条 */
+                memmove(&s_queue[i], &s_queue[i+1],
+                        (s_q_count - i - 1) * sizeof(FS_SlotIdx_t));
+                s_q_count--;
+                return false;
+            }
+            return true;
+        }
+    }
+    return false;   /* 已确认/被丢弃/不存在 */
+}
+
 uint32_t FS_PendingCount(void) { return s_q_count; }
 uint32_t FS_DroppedCount(void) { return s_dropped; }
 
 FS_Err_t FS_Recycle(void)
 {
+    if (!s_data_ready) return FS_ERR_NOTREADY;
+
     /* 目标扇区 = 另一个数据扇区 */
     uint32_t target = (s_act_data_addr == FS_SECTOR5_ADDR) ? FS_SECTOR6_ADDR
                                                            : FS_SECTOR5_ADDR;

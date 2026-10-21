@@ -18,8 +18,14 @@
   *   - 发送前检查 UART 返回值，串口未发出不算"等待云端 ACK"；
   *   - 退避重发后转 SENDING（原实现停在 BACKOFF 每 tick 重发，退避失效）；
   *   - 指数退避位移做钳位，消除 1u<<(n-1) 溢出 UB；
-  *   - boot_id 落盘失败进入"身份存储故障"，禁止生成新记录，避免撞云端历史。
-  ******************************************************************************
+ *   - boot_id 落盘失败进入"身份存储故障"，禁止生成新记录，避免撞云端历史。
+ *
+ * 可靠性加固（2026-10-21 第二批，对应审查意见）：
+ *   - pending 编号在"选中该条"时确定，退避重发按 boot_id+seq 精确取回同一条
+ *     （原先重发读队首，插队发送后会把 pending 换成历史记录，迟到 ACK 匹配不上）；
+ *   - uptime_ms 改为 64 位累加，跨越 HAL_GetTick 的 32 位回绕（约 49.7 天）；
+ *   - FS_Init 返回状态，数据区未就绪时禁止生成新记录（避免写进无有效头的区域）。
+ ******************************************************************************
   */
 #include "dtu.h"
 #include "flash_store.h"
@@ -59,6 +65,13 @@ static uint32_t     s_seq          = 0;      /* 本次启动内 seq 递增（契
 static uint32_t     s_boot_id = 0;
 /* 身份层状态：true=本次 boot_id 已成功落盘并校验，允许生成新记录 */
 static bool         s_identity_ok = false;
+/* 存储层状态：false=数据区初始化失败，禁止追加/回收 */
+static bool         s_storage_ok = false;
+
+/* 64 位运行时长：HAL_GetTick() 只有 32 位、约 49.7 天回绕，
+   按无符号差值累加后可跨越回绕继续单调递增（契约 uint64 语义）。 */
+static uint64_t     s_uptime_ms = 0;
+static uint32_t     s_uptime_tick = 0;
 
 /* ====== 内部函数 ====== */
 
@@ -149,7 +162,9 @@ static int Dtu_Send(const uint8_t *data, uint16_t len)
 }
 
 /* 发送一条记录；返回 1=已从串口发出（不代表云端入库），0=串口未发出。
-   tx 改为 static，避免 512B 栈占用叠加 Dtu_BuildTelemetry 的浮点/snprintf 峰值。 */
+   tx 改为 static，避免 512B 栈占用叠加 Dtu_BuildTelemetry 的浮点/snprintf 峰值。
+   注意：pending 编号由调用方在"选中该条"时设置，这里不再改写，
+   否则插队发送后的重发会把 pending 换成队首历史记录，导致迟到 ACK 无法匹配。 */
 static int Dtu_SendRecord(const FS_Record_t *rec)
 {
     static char s_tx_buf[DTU_TX_BUF_SIZE];
@@ -157,8 +172,6 @@ static int Dtu_SendRecord(const FS_Record_t *rec)
     if (Dtu_Send((const uint8_t*)s_tx_buf, len) != 0) {
         return 0;   /* 串口未发出：不计为云端失败，调用方稍后重试 */
     }
-    s_pending_boot = rec->boot_id;
-    s_pending_seq  = rec->seq;
     s_last_send_ms = HAL_GetTick();
     return 1;
 }
@@ -208,6 +221,8 @@ static int Dtu_ParseAck(const char *obj)
     if (strcmp(msgid, expect) != 0) return 0;
 
     FS_MarkConfirmed(s_pending_boot, s_pending_seq);
+    s_pending_boot = 0;          /* 本次等待结束，避免迟到的重复 ACK 再匹配 */
+    s_pending_seq  = 0;
     s_state = DTU_IDLE;
     s_retry_cnt = 0;
     return 1;
@@ -267,6 +282,7 @@ static void Dtu_ProcessRx(void)
 static void Dtu_MaybeNewRecord(void)
 {
     if (!s_identity_ok) return;   /* 身份未落盘校验：禁止生成新记录，避免撞云端历史 */
+    if (!s_storage_ok)  return;   /* 数据区未就绪：写进去也恢复不了，先不写 */
     uint32_t now = HAL_GetTick();
     if (now - s_last_record_ms >= DTU_NEW_RECORD_MS) {
         s_last_record_ms = now;
@@ -276,7 +292,7 @@ static void Dtu_MaybeNewRecord(void)
         rec.seq       = ++s_seq;   /* 本次启动内从1递增；重发保留原编号 */
         rec.sampled_at= 0;      /* 无RTC，契约§5 填0 */
         rec.time_quality = 0;   /* 无可信时间 */
-        rec.uptime_ms = now;    /* 采样时刻运行时长 */
+        rec.uptime_ms = s_uptime_ms;   /* 采样时刻运行时长（64位，抗 tick 回绕） */
         rec.confirmed = false;
 
         /* 从 g_env 填 8 通道 + valid */
@@ -327,10 +343,14 @@ static void Dtu_RunStateMachine(void)
                 if (!FS_Peek(&rec, true)) break;
                 s_hist_sent++;
             }
+            /* 先记录本次 pending（选中的这一条），再发送：
+               后续重发/ACK 匹配都以它为基准，不受队首变化影响 */
+            s_pending_boot = rec.boot_id;
+            s_pending_seq  = rec.seq;
             if (Dtu_SendRecord(&rec)) {
                 s_state = DTU_SENDING;
             } else {
-                /* 串口未发出：不计云端失败，稍后重试 */
+                /* 串口未发出：不计云端失败，稍后重试同一条（pending 已置） */
                 s_state = DTU_BACKOFF;
                 s_next_action_ms = now + DTU_SEND_SLOT_MS;
             }
@@ -357,24 +377,40 @@ static void Dtu_RunStateMachine(void)
                 s_state = DTU_PROBE;
                 s_next_action_ms = now;   /* 立即探测一次 */
             } else {
-                /* 重发当前 pending（同一 msg_id，保留编号；队首即 pending） */
+                /* 重发"当前 pending"这一条（可能是插队发出的最新记录，
+                   而非队首历史记录）：换记录重发会让迟到的 ACK 对不上。 */
                 FS_Record_t rec;
-                if (FS_Peek(&rec, true)) {
+                if (s_pending_seq != 0 &&
+                    FS_ReadById(s_pending_boot, s_pending_seq, &rec)) {
                     if (Dtu_SendRecord(&rec)) s_state = DTU_SENDING;
                     else s_next_action_ms = now + DTU_SEND_SLOT_MS;
+                } else if (s_pending_seq != 0) {
+                    /* pending 已被确认或已被丢弃：结束本次等待，重新调度 */
+                    s_pending_boot = 0;
+                    s_pending_seq  = 0;
+                    s_retry_cnt    = 0;
+                    s_state        = DTU_IDLE;
                 } else {
-                    s_state = DTU_IDLE;
+                    s_state = DTU_IDLE;   /* 无 pending（未真正发出过），回空闲重选 */
                 }
             }
         }
         break;
 
     case DTU_PROBE:
-        /* 周期探测：每30s发一条最新试探，收到ACK即恢复 */
+        /* 周期探测：沿用当前 pending，没有 pending 时取队首并登记 */
         if ((int32_t)(now - s_next_action_ms) >= 0) {
             FS_Record_t rec;
-            bool pending = FS_Peek(&rec, true);
-            if (pending) {
+            bool have = (s_pending_seq != 0) &&
+                        FS_ReadById(s_pending_boot, s_pending_seq, &rec);
+            if (!have) {
+                if (FS_Peek(&rec, true)) {
+                    s_pending_boot = rec.boot_id;
+                    s_pending_seq  = rec.seq;
+                    have = true;
+                }
+            }
+            if (have) {
                 (void)Dtu_SendRecord(&rec);   /* 结果忽略，保持探测节奏 */
             } else {
                 s_state = DTU_IDLE;           /* 无待发，恢复空闲 */
@@ -389,7 +425,8 @@ static void Dtu_RunStateMachine(void)
 
 void Dtu_Init(void)
 {
-    FS_Init();
+    /* 数据区初始化失败时不允许后续追加（否则写进无有效扇区头的区域，重启即丢） */
+    s_storage_ok = (FS_Init() == FS_OK);
 
     /* 身份层：只有 FS_NextBootId 成功落盘并校验通过才允许生成新记录。
        失败则进入"身份存储故障"：禁止新建/上传新数据，但保留补传已持久化旧记录。 */
@@ -407,6 +444,9 @@ void Dtu_Init(void)
     s_last_send_ms = 0;
     s_pending_boot = 0;
     s_pending_seq  = 0;
+    /* 64 位运行时长起点 */
+    s_uptime_ms   = 0;
+    s_uptime_tick = HAL_GetTick();
     /* 以当前时刻为基准，第一条记录在 DTU_NEW_RECORD_MS 后生成（契约 §8.1）。
        若置 0，HAL_GetTick() 起点接近 0 会导致上电瞬间立即写一条。 */
     s_last_record_ms = HAL_GetTick();
@@ -431,6 +471,11 @@ uint8_t *Dtu_RxByteBuf(void) { return &s_rx_byte; }
 
 void Dtu_Tick(void)
 {
+    /* 先累加 64 位运行时长，确保本次生成的记录用的是最新时刻 */
+    uint32_t now = HAL_GetTick();
+    s_uptime_ms += (uint32_t)(now - s_uptime_tick);
+    s_uptime_tick = now;
+
     Dtu_MaybeNewRecord();
     Dtu_RunStateMachine();
     Dtu_ProcessRx();
@@ -440,3 +485,5 @@ uint32_t Dtu_PendingCount(void) { return FS_PendingCount(); }
 uint32_t Dtu_DroppedCount(void) { return FS_DroppedCount(); }
 uint32_t Dtu_LastBootId(void)   { return s_boot_id; }
 uint8_t  Dtu_IdentityOk(void)   { return s_identity_ok ? 1 : 0; }
+uint8_t  Dtu_StorageOk(void)    { return s_storage_ok ? 1 : 0; }
+uint64_t Dtu_UptimeMs(void)     { return s_uptime_ms; }
