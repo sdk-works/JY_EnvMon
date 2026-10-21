@@ -5,14 +5,15 @@
   *
  * 布局（物理 64×16 像素，每次整屏只显示一项指标，8 秒切换）：
  *   名称区  X=0 , Y=2 , W=24, H=12   两个 12×12 汉字（CO2 用英文小字）
- *   数值区  X=26, Y=0 , W=38, H=8    数值字库（默认 6×8，可切 7×8），最多 5~6 字符
- *   单位区  X=26, Y=8 , W=38, H=8    固定 6×8，最多 6 字符
+ *   数值区  X=26, Y=0 , W=38, H=8    E000 7×8，最多 5 字符
+ *   单位区  X=26, Y=8 , W=38, H=8    E000 7×8，最多 5 字符
  *   数值与单位都水平居中于同一竖线（X 中心 = 26 + 38/2 = 45），视觉上成一列。
  *   左右间隔 2 像素；名称区 Y=2 使 12px 字落在 16px 屏正中。
  *   精度：温度/湿度/气压固定 1 位小数；土湿、CO2、EC 为整数。
   *
-  * 温度单位 = "°C"：同一单位区内先切中文字库输出 °(A1E3)，再切英文字库输出 C。
-  *   协议允许在内容中间用 \F 反复切换字库，因此一个区域可混用不同字库。
+ * 温度单位 = "°C"：同一单位区内先切中文字库输出 °(A1E3)，再切英文字库输出 C。
+ *   已知问题（本次不解决）：° 用 12×12 中文、C 用 8 高英文，同一区域混用不同高度
+ *   字体，协议并不允许；单位区仅高 8，实际效果需单独验证。
   *
   * 协议要点（BX-5K/6K 通讯协议）：
   *   帧头 8×0xA5，帧尾 0x5A，包校验 CRC16(初值0, poly=0xA001)
@@ -23,7 +24,7 @@
   *   注意：外层 AreaDataLen 是 2 字节，区域末尾 DataLen 是 4 字节，二者不同。
   *
   * 字库（协议 §11.1：内容开始处必须用 "\F"+字库名 指定字库）：
-  *   中文 O000 = 12×12 宋体；英文/数字 E000 = 6×8 Arial。
+  *   中文 O000 = 12×12 宋体；英文/数字 E000 = 7×8 Arial。
   *   程序按区域分别调用字库，中英文分区域/分段，不把不同高度的字混在同一段。
   ******************************************************************************
   */
@@ -34,7 +35,7 @@
 /* ===== 字库尺寸（须与仰邦字库工具里生成的字模一致） ===== */
 #define SCREEN_CN_W        12
 #define SCREEN_CN_H        12
-#define SCREEN_EN_W         6
+#define SCREEN_EN_W         7
 #define SCREEN_EN_H         8
 
 /* ===== 三区域几何（像素） ===== */
@@ -54,8 +55,9 @@
 #define AREA_UNI_H          8
 
 /* ===== 区域显示参数 ===== */
-/* DisplayMode：本机实测 0x00 为静止（协议标称 0x01=静止，如需可改 0x01） */
-#define SCREEN_AREA_MODE_FIXED  0x00
+/* DisplayMode：协议规定 0x01 = 静止显示；实屏已验证 0x01 正常。
+ * 早期注释“实测 0x00 为静止”已作废，不要改回 0x00。 */
+#define SCREEN_AREA_MODE_FIXED  0x01
 /* ProcessMode：1=收到动态信息后清区域并初始化（每帧重画三个区域，避免残影） */
 #define SCREEN_PROC_MODE        0x01
 /* TextAlignment 是位域：bit[1:0] 00左/01右/10居中，bit[3:2] 00上/01下/10居中 */
@@ -63,30 +65,22 @@
 
 /* ===== 字库名（须与控制器内实际下载的字库名一致） ===== */
 #define SCREEN_FONT_NAME_CN  "O000"   /* 12×12 中文（字号 9） */
-#define SCREEN_FONT_NAME_EN  "E000"   /* 6×8  英文/单位 */
-#define SCREEN_FONT_ESC_LEN   6U      /* "\F" + 4 位字库名 */
+#define SCREEN_FONT_NAME_EN  "E000"   /* 7×8  英文/单位 */
+#define SCREEN_FONT_ESC_LEN   9U      /* "\F" + 4 位字库名 + "\C1" 红色 */
 
-/* ===== 数值字库 / 每区最大字符数 =====
- * 右区可用宽 38px，区域不做额外字间距（协议无「字间距」字段，字符步进 = 字框宽度）：
- *   6×8 → 38/6 = 6 字符；7×8 → 38/7 = 5 字符。
- * 数值用 7×8 数字点阵更清晰，但需在仰邦工具里另做 E001（宽7 高8）。
- * 未做 E001 前保持 0（沿用 E000 6×8），否则数值区会空白。 */
-#define SCREEN_USE_7x8_NUM      0
-#if SCREEN_USE_7x8_NUM
-  #define SCREEN_FONT_NAME_NUM  "E001"
-  #define SCREEN_NUM_FONT_W     7
-  #define SCREEN_VAL_MAX        5      /* 38px / 7px = 5，如 101.4 / -10.5 / 65535 */
-  #define SCREEN_LUX_KLX_MIN    100000UL   /* 6 位放不下，≥1e5 lux 转 klx */
-#else
-  #define SCREEN_FONT_NAME_NUM  SCREEN_FONT_NAME_EN
-  #define SCREEN_NUM_FONT_W     6
-  #define SCREEN_VAL_MAX        6      /* 38px / 6px = 6 */
-  #define SCREEN_LUX_KLX_MIN    1000000UL
-#endif
+/* ===== 数值 / 单位字库与每区最大字符数 =====
+ * 右区宽 38px，E000 为 7×8，字符步进 = 字框宽度（协议支持字间距扩展，本次不启用）：
+ *   38 / 7 = 5 字符。数值与单位分别按各自上限检查。
+ * 不再使用 E001；数值与单位统一 E000 7×8。 */
+#define SCREEN_FONT_NAME_NUM  SCREEN_FONT_NAME_EN
+#define SCREEN_NUM_FONT_W     SCREEN_EN_W
+#define SCREEN_VAL_MAX        (AREA_VAL_W / SCREEN_NUM_FONT_W)   /* 5，如 101.4 */
+#define SCREEN_UNIT_MAX       (AREA_UNI_W / SCREEN_EN_W)         /* 5，如 uS/cm */
+#define SCREEN_LUX_KLX_MIN    100000UL   /* 5 字符放不下 6 位，≥1e5 lux 转 klx */
 
 /* ===== 单位 ===== */
 /* 温度单位 = °(中文字库) + C(英文字库) 拼接，同一单位区内中途切换 \F：
- *   ° 在 GB2312 是 A1E3，只有中文字库有；C 走 6×8 英文字库。
+ *   ° 在 GB2312 是 A1E3，只有中文字库有；C 走 7×8 英文字库。
  *   注意：° 来自 12×12 中文字模，而单位区仅 8px 高——° 字形位于字模上部，
  *   正常情况不会落到被裁的底部。若实测 ° 被切或与 C 基线不齐，
  *   把 SCREEN_TEMP_UNIT_DEG_C 置 0，退回单一 ASCII "C"。 */
@@ -103,8 +97,8 @@ static const uint8_t U_C  [] = {'C'};          /* C ASCII（英文字库） */
 #define U_PCT    "%"
 
 /* 电导单位：正确物理量是 µS/cm（不能缩成 µS / uS，否则物理量变了）。
- * µ(0xB5) 不在 ASCII 里，需在 6×8 英文字库里做该字形；未做时用兼容写法 uS/cm。
- * 6×8 下 5 字符 = 30px，38px 区余 8px，绝不裁切；7×8 下 35px，余 3px。 */
+ * µ(0xB5) 不在 ASCII 里，需在 7×8 英文字库里做该字形；未做时用兼容写法 uS/cm。
+ * 7×8 下 5 字符 = 35px，38px 区余 3px，不会裁切。 */
 #define SCREEN_EC_USE_MICRO   0
 #if SCREEN_EC_USE_MICRO
   #define U_EC  "\xB5" "S/cm"   /* 拆成两个字面量，避免 \xB5S 被当成一个转义 */
@@ -113,12 +107,12 @@ static const uint8_t U_C  [] = {'C'};          /* C ASCII（英文字库） */
 #endif
 
 /* ===== 缓冲尺寸 ===== */
-#define SCREEN_AREA_DATA_MAX  20U   /* 每区域数据上限：\F 各段之和 */
+#define SCREEN_AREA_DATA_MAX  32U   /* 每区域数据上限：\F 各段 + \C1 颜色之和 */
 #define SCREEN_REGION_LEN     23U   /* 区域头固定 23 字节 */
-#define SCREEN_BLOCK_MAX      (2U + SCREEN_REGION_LEN + 4U + SCREEN_AREA_DATA_MAX)  /* 49 */
-#define SCREEN_DOMAIN_MAX     (7U + 3U * SCREEN_BLOCK_MAX)                          /* 154 */
-#define SCREEN_RAW_MAX        (14U + SCREEN_DOMAIN_MAX + 2U)                        /* 170 */
-#define SCREEN_WIRE_MAX       (8U + 2U * SCREEN_RAW_MAX + 1U)                       /* 349 */
+#define SCREEN_BLOCK_MAX      (2U + SCREEN_REGION_LEN + 4U + SCREEN_AREA_DATA_MAX)  /* 61 */
+#define SCREEN_DOMAIN_MAX     (7U + 3U * SCREEN_BLOCK_MAX)                          /* 190 */
+#define SCREEN_RAW_MAX        (14U + SCREEN_DOMAIN_MAX + 2U)                        /* 206 */
+#define SCREEN_WIRE_MAX       (8U + 2U * SCREEN_RAW_MAX + 1U)                       /* 421 */
 
 /* 一帧内的一个显示区域：data 已是含 \F 字库转义的完整显示数据 */
 typedef struct {
@@ -173,12 +167,15 @@ static uint16_t fmt_na(char *buf)
     return 2;
 }
 
-/* 向区域数据追加一段：\F + 字库名(4) + 文本；返回写入字节数 */
+/* 向区域数据追加一段：\F + 字库名(4) + \C1(红色) + 文本；返回写入字节数 */
 static uint16_t Screen_Seg(uint8_t *dst, const char *font, const uint8_t *text, uint16_t n)
 {
     dst[0] = 0x5C;                 /* '\' */
     dst[1] = 'F';
     memcpy(dst + 2, font, 4);
+    dst[6] = 0x5C;                 /* '\' */
+    dst[7] = 'C';
+    dst[8] = '1';                  /* 显式红色 */
     if (n) memcpy(dst + SCREEN_FONT_ESC_LEN, text, n);
     return (uint16_t)(SCREEN_FONT_ESC_LEN + n);
 }
@@ -387,9 +384,9 @@ void Screen_ShowItem(uint8_t idx)
         return;
     }
 
-    /* 超宽保护：>6 字符显示 ERR，不截断前后数字 */
-    if (vlen > SCREEN_VAL_MAX) { strcpy(val, "ERR"); vlen = 3; }
-    if (ulen > SCREEN_VAL_MAX) { strcpy(uni, "ERR"); ulen = 3; }
+    /* 超宽保护：超过各自上限显示 ERR，不截断前后数字 */
+    if (vlen > SCREEN_VAL_MAX)  { strcpy(val, "ERR"); vlen = 3; }
+    if (ulen > SCREEN_UNIT_MAX) { strcpy(uni, "ERR"); ulen = 3; }
 
     /* ---- 名称区：中文用中文字库，纯 ASCII（CO2）用英文字库 ---- */
     if (name[0] < 0x80) name_font = SCREEN_FONT_NAME_EN;
@@ -397,7 +394,7 @@ void Screen_ShowItem(uint8_t idx)
     areas[0].w = AREA_NAME_W; areas[0].h = AREA_NAME_H;
     areas[0].len = Screen_Seg(areas[0].data, name_font, name, nlen);
 
-    /* ---- 数值区：数值字库（默认 6×8，可切 7×8） ---- */
+    /* ---- 数值区：E000 7×8 ---- */
     areas[1].x = AREA_VAL_X; areas[1].y = AREA_VAL_Y;
     areas[1].w = AREA_VAL_W; areas[1].h = AREA_VAL_H;
     areas[1].len = Screen_Seg(areas[1].data, SCREEN_FONT_NAME_NUM, (const uint8_t *)val, vlen);
