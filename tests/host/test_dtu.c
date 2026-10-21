@@ -749,6 +749,78 @@ static void case_power_loss_in_migration(void)
     ck(flash_sim_reprogram() == 0, "恢复迁移不得二次编程");
 }
 
+/* 19. 迁移可观测性：阶段序列 / 按进展喂狗 / 统计计数
+   上板"定点断电"测试依赖阶段标记，满缓存迁移不会饿死看门狗依赖进度回调。
+   这里把这两件事在主机上钉住：阶段顺序错了，断电点就定位错了。 */
+static uint32_t s_phases[16];
+static uint32_t s_phase_n;
+static uint32_t s_progress_n;
+
+static void on_phase(uint8_t ph) { if (s_phase_n < 16) s_phases[s_phase_n++] = ph; }
+static void on_progress(void)    { s_progress_n++; }
+
+static void case_migration_diag(void)
+{
+    FS_Diag_t d;
+    uint32_t i;
+    const uint32_t CAP  = (uint32_t)FLASH_STORE_CAP_PER_SECTOR;
+    const uint32_t DROP = CAP / 8;          /* 255 */
+
+    begin("migration_diag");
+    flash_sim_reset();
+    Dtu_Init();
+    for (i = 1; i <= 5; i++) ck(append_seq(1, i, i), "前置：写 5 条");
+
+    s_phase_n = 0; s_progress_n = 0;
+    FS_SetPhaseHook(on_phase);
+    FS_SetProgressHook(on_progress);
+
+    ck(FS_Recycle() == FS_OK, "手动迁移应成功");
+    /* 阶段顺序 = 定点断电的坐标轴，必须严格按 擦目标→复制→提交→擦旧→空闲 */
+    ck(s_phase_n == 5, "阶段回调应为 5 次（含收尾 IDLE）");
+    ck(s_phases[0] == FS_PHASE_ERASE_TARGET, "阶段1 = 擦目标扇区");
+    ck(s_phases[1] == FS_PHASE_COPY_RECORDS, "阶段2 = 复制记录");
+    ck(s_phases[2] == FS_PHASE_COMMIT,       "阶段3 = 写完成标识");
+    ck(s_phases[3] == FS_PHASE_ERASE_OLD,    "阶段4 = 擦旧扇区");
+    ck(s_phases[4] == FS_PHASE_IDLE,         "收尾回到 IDLE");
+
+    FS_GetDiag(&d);
+    ck(d.migrate_ok == 1 && d.migrate_fail == 0, "迁移计数应 +1、失败 0");
+    ck(d.phase == FS_PHASE_IDLE, "结束后阶段应为 IDLE");
+    ck(d.max_ms == d.last_ms, "max_ms 不应小于 last_ms");
+    /* 5 条：擦目标 1 次 + 擦旧 1 次 + 提交 1 次（复制不足 32 条不计） */
+    ck(s_progress_n == 3, "短迁移的进度回调应为 3 次（两擦+提交）");
+
+    /* 满缓存迁移：复制 1789 条，必须按进展多次喂狗，否则 4s 看门狗会中途复位 */
+    flash_sim_reset();
+    Dtu_Init();
+    for (i = 1; i <= CAP; i++) { if (!append_seq(1, i, i)) break; }
+    ck(i == CAP + 1, "前置：填满 2044 条");
+    s_progress_n = 0;
+    ck(append_seq(1, CAP + 1, 999u), "第 2045 条应写入成功（触发迁移）");
+    ck(s_progress_n >= (CAP - DROP) / FS_PROGRESS_STEP,
+       "满缓存迁移必须按进展多次喂狗（否则被 IWDG 复位）");
+    FS_GetDiag(&d);
+    ck(d.migrate_ok == 1 && d.phase == FS_PHASE_IDLE, "满缓存迁移应计 1 次且已收尾");
+
+    /* 失败路径：必须记录失败阶段，且阶段回到 IDLE（不能停留在"正在迁移"） */
+    flash_sim_reset();
+    Dtu_Init();
+    for (i = 1; i <= CAP; i++) { if (!append_seq(1, i, i)) break; }
+    s_phases[0] = 0xFF;
+    s_phase_n = 0;
+    flash_sim_fail_program_after(600);              /* 复制途中写失败 */
+    ck(!append_seq(1, CAP + 1, 7u), "迁移失败时不得写入新记录");
+    FS_GetDiag(&d);
+    ck(d.migrate_fail == 1 && d.migrate_ok == 0, "失败计数应为 1");
+    ck(d.fail_phase == FS_PHASE_COPY_RECORDS, "失败阶段应记录为复制记录");
+    ck(d.phase == FS_PHASE_IDLE, "失败后阶段必须回到 IDLE（可按此判故障）");
+    ck(FS_PendingCount() == CAP, "失败时队列一条都不能少");
+
+    FS_SetPhaseHook(0);
+    FS_SetProgressHook(0);
+}
+
 /* ============================================================ */
 int main(void)
 {
@@ -775,6 +847,7 @@ int main(void)
     case_confirm_word_corrupt();
     case_full_cache_migration();
     case_power_loss_in_migration();
+    case_migration_diag();
 
     fprintf(g_out, "\n===== RESULT: %d passed, %d failed =====\n", g_pass, g_fail);
     fprintf(g_out, "flash program ops = %u, erase ops = %u, reprogram violations = %u\n",

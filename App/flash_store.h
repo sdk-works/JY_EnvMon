@@ -167,4 +167,47 @@ uint32_t FS_DroppedCount(void);
 /* 整扇区迁移/回收（内部，掉电安全）。由 FS_Peek 出队触发或满时调用 */
 FS_Err_t FS_Recycle(void);
 
+/* ==================== 迁移可观测性（上板测试用） ====================
+ * 迁移是本模块唯一长时间阻塞主循环的操作：擦 2 个扇区 + 复制最多 2044 条记录。
+ * 上板必须知道"断电时正处在哪个阶段"以及"迁移到底阻塞多久"，故提供阶段标记、
+ * 进度回调与统计计数。三者都不改变数据路径，只是把内部时序暴露出来。 */
+
+/* 迁移阶段编号（阶段回调的入参也是这些值） */
+typedef enum {
+    FS_PHASE_IDLE         = 0,   /* 不在迁移中 */
+    FS_PHASE_ERASE_TARGET = 1,   /* 擦目标扇区 */
+    FS_PHASE_COPY_RECORDS = 2,   /* 逐条复制 + 回读校验 */
+    FS_PHASE_COMMIT       = 3,   /* 写迁移完成标识（committed 0xFFFFFFFF→0） */
+    FS_PHASE_ERASE_OLD    = 4,   /* 擦旧扇区（已在 RAM 侧切换完成） */
+} FS_Phase_t;
+
+typedef struct {
+    uint32_t migrate_ok;     /* 本次上电成功迁移次数 */
+    uint32_t migrate_fail;   /* 本次上电迁移失败次数（失败时旧扇区保持有效） */
+    uint32_t last_ms;        /* 最近一次成功迁移耗时（ms，含 2 次擦除） */
+    uint32_t max_ms;         /* 本次上电最长迁移耗时（ms） */
+    uint8_t  phase;          /* 当前/最近阶段 FS_Phase_t */
+    uint8_t  fail_phase;     /* 最近一次失败时所处阶段 */
+} FS_Diag_t;
+
+/* 复制一条记录的估算、擦除一次扇区的估算都不做假设：
+   上板实测 last_ms/max_ms 才是唯一依据（LSI 驱动的看门狗超时也有容差）。 */
+void FS_GetDiag(FS_Diag_t *out);
+
+/* 进度回调：每擦完一个扇区、每复制 FS_PROGRESS_STEP 条记录、写完成标识后各调一次。
+   用途：在长时间阻塞期间按【真实进展】喂看门狗 ——
+     迁移最坏情况（擦 2×128KB + 复制 2044 条）明显可能超过 4s 的 IWDG 超时，
+     若不喂狗会在迁移中途被复位；若整段无条件喂狗，则真正的 Flash 卡死
+     又不会被发现。按进展喂狗两者兼顾：有进展说明工作正常，卡住则不喂。
+   回调在临界路径上，必须极短（HAL_IWDG_Refresh 即可）。传 NULL 取消。 */
+void FS_SetProgressHook(void (*fn)(void));
+
+/* 阶段变化回调：进/出每个阶段各调一次（结束时 phase=FS_PHASE_IDLE）。
+   用途：GPIO 打点接示波器/逻辑分析仪，做"定点断电"测试；或调试串口打日志。
+   同样必须极短。传 NULL 取消。 */
+void FS_SetPhaseHook(void (*fn)(uint8_t phase));
+
+/* 进度回调的触发粒度（复制记录的条数间隔） */
+#define FS_PROGRESS_STEP 32
+
 #endif /* __FLASH_STORE_H */

@@ -119,6 +119,32 @@ typedef struct {
 static FS_SlotIdx_t s_queue[FS_RAM_CAP];
 static uint32_t     s_q_count = 0;  /* 未确认记录数 */
 
+/* ====== 迁移可观测性 ====== */
+static FS_Diag_t s_migdiag = {0, 0, 0, 0, FS_PHASE_IDLE, FS_PHASE_IDLE};
+static void (*s_progress_hook)(void) = 0;
+static void (*s_phase_hook)(uint8_t) = 0;
+
+/* 报告"迁移有进展"，用于按进展喂看门狗 */
+static void FS_Progress(void)
+{
+    if (s_progress_hook) s_progress_hook();
+}
+
+/* 切换阶段：记录 + 通知观察者（GPIO 打点 / 日志） */
+static void FS_Phase(uint8_t ph)
+{
+    s_migdiag.phase = ph;
+    if (s_phase_hook) s_phase_hook(ph);
+}
+
+void FS_GetDiag(FS_Diag_t *out)
+{
+    if (out) *out = s_migdiag;
+}
+
+void FS_SetProgressHook(void (*fn)(void))       { s_progress_hook = fn; }
+void FS_SetPhaseHook(void (*fn)(uint8_t phase)) { s_phase_hook = fn; }
+
 /* ====== 内部工具 ====== */
 
 /* 整扇区迁移（内部）：first 之前的待发记录视为本次丢弃，不复制。 */
@@ -365,10 +391,13 @@ static int FS_RelocateSlot(uint32_t idx)
 static int32_t FS_CopyPendingTo(uint32_t target_base, uint32_t new_gen,
                                uint32_t first, uint32_t keep)
 {
-    /* 先擦目标扇区 */
+    /* 先擦目标扇区（128KB 扇区擦除在 F4 上按数据手册是"秒级"操作，
+       是整个迁移里最长的单步，也是定点断电测试的第 1 个目标阶段） */
     uint32_t target_sector = (target_base == FS_SECTOR5_ADDR) ? FLASH_STORE_SECTOR_DATA_A
                                                               : FLASH_STORE_SECTOR_DATA_B;
+    FS_Phase(FS_PHASE_ERASE_TARGET);
     if (FS_EraseSector(target_sector) != 0) return -1;
+    FS_Progress();
 
     /* 扇区头：magic/generation/used 各编程一次；committed 保持擦除态
        （0xFFFFFFFF = 未完成），迁移全部成功后再一次性编程为 0。
@@ -394,7 +423,9 @@ static int32_t FS_CopyPendingTo(uint32_t target_base, uint32_t new_gen,
     if (*(volatile uint32_t *)(target_base + 8)  != 0xFFFFFFFFu) return -1;
     if (*(volatile uint32_t *)(target_base + 12) != hdr.used) return -1;
 
-    /* 逐条复制：任一条 CRC/提交标识校验失败即整体失败（不留下残缺扇区） */
+    /* 逐条复制：任一条 CRC/提交标识校验失败即整体失败（不留下残缺扇区）。
+       每复制 FS_PROGRESS_STEP 条报告一次进展（按进展喂狗，见 FS_SetProgressHook）。 */
+    FS_Phase(FS_PHASE_COPY_RECORDS);
     uint32_t copied = 0;
     for (uint32_t i = 0; i < keep; i++) {
         uint32_t src_addr = s_act_data_addr + FLASH_STORE_SECTOR_HDR
@@ -412,14 +443,17 @@ static int32_t FS_CopyPendingTo(uint32_t target_base, uint32_t new_gen,
             return -1;
         }
         copied++;
+        if ((copied % FS_PROGRESS_STEP) == 0) FS_Progress();
     }
 
     /* 总数核对：契约要求"逐条 CRC + 总数"，缺一不可 */
     if (copied != keep) return -1;
 
     /* 提交完成标识（最后写）+ 回读 */
+    FS_Phase(FS_PHASE_COMMIT);
     if (FS_ProgWord(target_base + 8, 0) != 0) return -1;
     if (*(volatile uint32_t *)(target_base + 8) != 0) return -1;
+    FS_Progress();
 
     return (int32_t)copied;
 }
@@ -518,6 +552,14 @@ FS_Err_t FS_Init(void)
 {
     s_boot_id = 0;
     s_dropped = 0;
+    /* 迁移统计按"本次上电"计数：复位后归零。跨复位只能靠云端 boot_id/seq
+       与本地扇区代次(generation)推断，不在 Flash 里额外写计数（省擦写）。 */
+    s_migdiag.migrate_ok   = 0;
+    s_migdiag.migrate_fail = 0;
+    s_migdiag.last_ms      = 0;
+    s_migdiag.max_ms       = 0;
+    s_migdiag.phase        = FS_PHASE_IDLE;
+    s_migdiag.fail_phase   = FS_PHASE_IDLE;
     s_data_ready = false;
     s_used = 0;
     s_q_count = 0;
@@ -856,6 +898,10 @@ static FS_Err_t FS_RecycleFrom(uint32_t first)
     if (first > s_q_count) first = s_q_count;
     uint32_t keep = s_q_count - first;
 
+    /* 耗时统计的起点：整段迁移（擦目标 + 复制 + 提交 + 擦旧）都在计时内，
+       上板用 last_ms/max_ms 与看门狗超时对比，判断是否需要更长超时或改策略。 */
+    uint32_t t0 = HAL_GetTick();
+
     /* 目标扇区 = 另一个数据扇区 */
     uint32_t target = (s_act_data_addr == FS_SECTOR5_ADDR) ? FS_SECTOR6_ADDR
                                                            : FS_SECTOR5_ADDR;
@@ -865,6 +911,10 @@ static FS_Err_t FS_RecycleFrom(uint32_t first)
        失败时 RAM 队列也一条未改 —— 调用方不会误以为自己已经丢了记录。 */
     int32_t copied = FS_CopyPendingTo(target, new_gen, first, keep);
     if (copied < 0) {
+        /* 记录失败发生在哪个阶段：这是"断电/写坏"定位的关键信息 */
+        s_migdiag.migrate_fail++;
+        s_migdiag.fail_phase = s_migdiag.phase;
+        FS_Phase(FS_PHASE_IDLE);
         return FS_ERR_CRC;          /* 旧扇区仍完整，下次可重试 */
     }
 
@@ -880,11 +930,19 @@ static FS_Err_t FS_RecycleFrom(uint32_t first)
     /* 擦旧扇区（数据已在新扇区提交；擦除失败不影响本次切换） */
     uint32_t old_sector = (s_act_data_addr == FS_SECTOR5_ADDR) ? FLASH_STORE_SECTOR_DATA_A
                                                                : FLASH_STORE_SECTOR_DATA_B;
+    FS_Phase(FS_PHASE_ERASE_OLD);
     (void)FS_EraseSector(old_sector);
+    FS_Progress();
     /* 切活动 */
     s_act_data_addr = target;
     s_act_data_gen  = new_gen;
     s_generation    = new_gen;
+
+    /* 统计：整个迁移的实测耗时 */
+    s_migdiag.migrate_ok++;
+    s_migdiag.last_ms = HAL_GetTick() - t0;
+    if (s_migdiag.last_ms > s_migdiag.max_ms) s_migdiag.max_ms = s_migdiag.last_ms;
+    FS_Phase(FS_PHASE_IDLE);
     return FS_OK;
 }
 
