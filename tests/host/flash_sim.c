@@ -59,6 +59,25 @@ static uint32_t g_erase_cnt     = 0;
 /* 故障注入 */
 int g_sim_erase_fail = 0;    /* 置 1 让下一次擦除返回 HAL_ERROR */
 
+/* 编程故障注入：模拟"迁移/确认过程中掉电"。
+   fail_after：再成功 n 次编程之后的那一次失败（0 = 下一次就失败）；-1 = 关闭。
+   partial   ：失败时是否把 word 写成"半成品"（既非全 FF 也非全 0），
+               用来复现"写确认字时掉电、确认字被写坏"的真实形态。 */
+static int g_prog_fail_after = -1;
+static int g_prog_fail_partial = 0;
+
+void flash_sim_fail_program_after(uint32_t n)
+{
+    g_prog_fail_after = (int)n;
+    g_prog_fail_partial = 0;
+}
+
+void flash_sim_partial_program_once(void)
+{
+    g_prog_fail_after = 0;
+    g_prog_fail_partial = 1;
+}
+
 /* UART 记录 */
 char     g_sim_tx[SIM_TX_MAX];
 uint16_t g_sim_tx_len   = 0;
@@ -82,6 +101,8 @@ void flash_sim_reset(void)
     g_prog_ok_cnt   = 0;
     g_erase_cnt     = 0;
     g_sim_erase_fail = 0;
+    g_prog_fail_after = -1;
+    g_prog_fail_partial = 0;
     g_sim_tick      = 0;
     g_sim_tx_len    = 0;
     g_sim_tx_count  = 0;
@@ -173,6 +194,22 @@ HAL_StatusTypeDef HAL_FLASH_Program(uint32_t TypeProgram, uint32_t Address, uint
     if ((old & nv) != nv) {   /* 只能 1→0（擦除态下恒成立，保留以表达语义） */
         g_reprogram_cnt++;
         return HAL_ERROR;
+    }
+
+    /* 编程故障注入：模拟迁移/确认途中掉电 */
+    if (g_prog_fail_after >= 0) {
+        if (g_prog_fail_after == 0) {
+            int partial = g_prog_fail_partial;
+            g_prog_fail_after = -1;
+            g_prog_fail_partial = 0;
+            if (partial) {
+                /* 半成品：高位保留一点 1、低位写 0，结果既不是 FFFFFFFF 也不是 0 */
+                uint32_t pv = (nv & 0xFFFFFF00u) | 0x0000FF00u;
+                memcpy(&g_flash[off], &pv, 4);
+            }
+            return HAL_ERROR;      /* 未写入（或只写坏）→ 由调用方回读判定 */
+        }
+        g_prog_fail_after--;
     }
 
     memcpy(&g_flash[off], &nv, 4);

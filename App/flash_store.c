@@ -10,11 +10,17 @@
   *     两个扇区都失效才从1开始。
   *   - 状态位只从1→0；CRC 只覆盖不变数据；提交标识区分完整/残缺记录。
   *
-  * 可靠性加固（2026-10-21）：
-  *   - 每个 Flash 写/擦操作检查 HAL 返回值；元数据回读 boot+gen+CRC 三项；
-  *   - 记录写入后回读解包校验 CRC/提交位/boot/seq，通过后才入队；
-  *   - 确认位写入后回读 [54]==0 && [55]==0 才出队，失败保留待确认；
-  *   - 迁移扇区头写入后回读校验（magic/代次/committed/used）。
+ * 可靠性加固（2026-10-21 第二批，针对第三方审查 1d48590 的三项发现）：
+ *   - 元数据"空白"判定改为整条记录（32B）全检，不再只看槽首 word：
+ *     槽首被擦回 FF、槽尾仍有残留时，必须判为"身份损坏"而非"首次使用"；
+ *   - FS_IdentityRepair 增加单调性下限：min_boot_id 低于已知最大编号一律拒绝，
+ *     下限 = max(人工下限, 内存编号, 两元数据扇区有效最大, 活动数据区有效最大)，
+ *     且全部校验在擦除之前完成，杜绝 3→1 这种编号倒退；
+ *   - 确认字三态化（FF=待确认 / 00=已确认 / 其它=写坏）：写坏说明当初写确认字
+ *     时掉电、而 ACK 已经收到，按已确认出队，避免"每次 ACK 都被 F4 拒绝 →
+ *     同一条记录永远出不了队"；
+ *   - 队列满时先迁移、成功后才丢掉最旧 1/8（原实现先丢后迁移，迁移失败会
+ *     静默丢掉 255 条已持久化记录）。
   *
   * 简化说明：本实现把"待发记录索引"维护在RAM（每条64B，最多约2000条=128KB RAM 的
   * 子集，F407 有 192KB RAM 可用），Flash 负责掉电持久化恢复。
@@ -114,6 +120,9 @@ static uint32_t     s_q_count = 0;  /* 未确认记录数 */
 
 /* ====== 内部工具 ====== */
 
+/* 整扇区迁移（内部）：first 之前的待发记录视为本次丢弃，不复制。 */
+static FS_Err_t FS_RecycleFrom(uint32_t first);
+
 /* 把记录打包成 64B 缓冲区（Flash 记录格式） */
 static void FS_PackRecord(const FS_Record_t *r, uint8_t out[FLASH_STORE_REC_SIZE])
 {
@@ -140,6 +149,22 @@ static void FS_PackRecord(const FS_Record_t *r, uint8_t out[FLASH_STORE_REC_SIZE
        写入时保持擦除态（跳过编程），等 ACK 到达再一次性编程为 0。 */
 }
 
+/* 确认字三态。第三态（既非全 FF 也非全 0）只可能来自"写确认字时掉电"：
+   该 word 被编程了一部分。F4 不允许对同一 word 二次编程，所以它既不能被
+   补写成 0，也不能被改回 FF —— 只能按"已确认"处理。
+   语义依据：确认字只在本机收到 status=stored 的 ACK 后才编程，因此看到
+   半个 0 就意味着那次 ACK 确实到过本机，数据已在云端。 */
+#define FS_CONFIRM_PRISTINE  0   /* 0xFFFFFFFF 待确认，可编程 */
+#define FS_CONFIRM_DONE      1   /* 0x00000000 已确认 */
+#define FS_CONFIRM_BAD       2   /* 其它值：写确认字时掉电，字已写坏 */
+
+static int FS_ConfirmState(uint32_t confirm_word)
+{
+    if (confirm_word == 0xFFFFFFFFu) return FS_CONFIRM_PRISTINE;
+    if (confirm_word == 0x00000000u) return FS_CONFIRM_DONE;
+    return FS_CONFIRM_BAD;
+}
+
 /* 解包 + 校验 CRC */
 static int FS_UnpackRecord(const uint8_t in[FLASH_STORE_REC_SIZE], FS_Record_t *r)
 {
@@ -156,11 +181,14 @@ static int FS_UnpackRecord(const uint8_t in[FLASH_STORE_REC_SIZE], FS_Record_t *
     r->time_quality = in[20];
     r->valid     = in[21];
     memcpy(r->data, &in[22], FS_CH_NUM * 4);
-    /* 已确认判定：新格式看独立确认字[60..63]==0x00000000；
-       旧格式（[54] 被编程为 0x00）依然兼容读出为已确认。 */
+    /* 已确认判定：新格式看独立确认字[60..63]；
+       旧格式（[54] 被编程为 0x00）依然兼容读出为已确认。
+       确认字写坏（FS_CONFIRM_BAD）按已确认处理，理由见 FS_ConfirmState 注释：
+       否则这条记录会被无限重发，且每次 ACK 都试图对同一 word 二次编程。 */
     uint32_t confirm_word;
     memcpy(&confirm_word, &in[60], 4);
-    r->confirmed = (in[54] != 0xFF) || (confirm_word == 0x00000000u);
+    r->confirmed = (in[54] != 0xFF) ||
+                   (FS_ConfirmState(confirm_word) != FS_CONFIRM_PRISTINE);
     return 0;
 }
 
@@ -261,9 +289,12 @@ static uint32_t FS_LoadDataSector(uint32_t base, uint32_t used)
 }
 
 /* 把未确认记录从源(活动)扇区复制到目标扇区并更新头（迁移用）。
+   first 之前的记录视为本次要丢弃的最旧一批，不复制（队列满时用）。
+   keep = s_q_count - first，即需要保留的条数。
    契约 §10.5：必须逐条 CRC 校验 + 总数核对 + 迁移完成标识，缺一不可。
    返回实际复制条数；任何一条失败或总数不符返回 -1（调用方据此保留旧扇区）。 */
-static int32_t FS_CopyPendingTo(uint32_t target_base, uint32_t new_gen)
+static int32_t FS_CopyPendingTo(uint32_t target_base, uint32_t new_gen,
+                               uint32_t first, uint32_t keep)
 {
     /* 先擦目标扇区 */
     uint32_t target_sector = (target_base == FS_SECTOR5_ADDR) ? FLASH_STORE_SECTOR_DATA_A
@@ -277,7 +308,7 @@ static int32_t FS_CopyPendingTo(uint32_t target_base, uint32_t new_gen)
     hdr.magic = FS_MAGIC;
     hdr.generation = new_gen;
     hdr.committed = 0xFFFFFFFF;   /* 未完成（擦除态，不编程） */
-    hdr.used = s_q_count;
+    hdr.used = keep;
 
     /* 先确认四个头 word 都处于擦除态，否则说明擦除未生效，拒绝继续写 */
     for (int i = 0; i < 4; i++) {
@@ -296,9 +327,9 @@ static int32_t FS_CopyPendingTo(uint32_t target_base, uint32_t new_gen)
 
     /* 逐条复制：任一条 CRC/提交标识校验失败即整体失败（不留下残缺扇区） */
     uint32_t copied = 0;
-    for (uint32_t i = 0; i < s_q_count; i++) {
+    for (uint32_t i = 0; i < keep; i++) {
         uint32_t src_addr = s_act_data_addr + FLASH_STORE_SECTOR_HDR
-                          + s_queue[i].slot * FLASH_STORE_REC_SIZE;
+                          + s_queue[first + i].slot * FLASH_STORE_REC_SIZE;
         FS_Record_t rec;
         if (FS_UnpackRecord((const uint8_t*)src_addr, &rec) != 0) {
             return -1;                      /* 源记录损坏，整体放弃迁移 */
@@ -315,7 +346,7 @@ static int32_t FS_CopyPendingTo(uint32_t target_base, uint32_t new_gen)
     }
 
     /* 总数核对：契约要求"逐条 CRC + 总数"，缺一不可 */
-    if (copied != s_q_count) return -1;
+    if (copied != keep) return -1;
 
     /* 提交完成标识（最后写）+ 回读 */
     if (FS_ProgWord(target_base + 8, 0) != 0) return -1;
@@ -331,7 +362,12 @@ static uint32_t FS_MaxBootInSector(uint32_t base, uint32_t cap)
     for (uint32_t k = 0; k < cap; k++) {
         uint32_t addr = base + k * FS_META_REC_SIZE;
         uint32_t b = *(volatile uint32_t*)addr;
-        if (b == 0xFFFFFFFF) break;   /* 空槽，之后也是空的 */
+        if (b == 0xFFFFFFFF) {
+            /* 槽首 word 是擦除态：本槽不可能是有效记录，但【不能 break】。
+               "槽首为 FF、槽尾有残留"的槽真实存在（见 FS_MetaSlotBlank），
+               它后面仍可能出现有效记录。 */
+            continue;
+        }
         uint16_t crc = Modbus_CRC16((const uint8_t*)addr, 8);
         uint16_t stored = *(volatile uint16_t*)(addr + 8);
         if (crc == stored && b > boot) boot = b;
@@ -339,14 +375,43 @@ static uint32_t FS_MaxBootInSector(uint32_t base, uint32_t cap)
     return boot;
 }
 
-/* 判断元数据扇区是否处于擦除态（全部槽首 word 为 0xFFFFFFFF）。
+/* 一个元数据槽（32B）是否完全处于擦除态。
+   必须整条检查：只查槽首 word 时，"槽首被擦回 FF、其余字节仍有残留"的槽
+   会被误判为空白，于是"有内容但无效"被当成"首次使用"，程序自动从 1 重新
+   编号 —— 直接与云端历史 msg_id 撞号。 */
+static int FS_MetaSlotBlank(uint32_t addr)
+{
+    for (uint32_t off = 0; off < FS_META_REC_SIZE; off += 4) {
+        if (*(volatile uint32_t *)(addr + off) != 0xFFFFFFFFu) return 0;
+    }
+    return 1;
+}
+
+/* 判断元数据扇区是否处于擦除态（每条记录 32B 全部为 0xFF）。
    用于区分"首次使用（空白）"与"有内容但无效（损坏）"。 */
 static int FS_MetaBlank(uint32_t base, uint32_t cap)
 {
     for (uint32_t k = 0; k < cap; k++) {
-        if (*(volatile uint32_t *)(base + k * FS_META_REC_SIZE) != 0xFFFFFFFFu) return 0;
+        if (!FS_MetaSlotBlank(base + k * FS_META_REC_SIZE)) return 0;
     }
     return 1;
+}
+
+/* 扫描指定数据扇区中 CRC 有效记录里的最大 boot_id。
+   身份修复时用它兜底：元数据可能全丢，但数据区里还留着"这台机器用到过
+   哪个编号"的证据，恢复下限不能低于它。 */
+static uint32_t FS_MaxBootInData(uint32_t base, uint32_t used)
+{
+    uint32_t boot = 0;
+    if (used > FLASH_STORE_CAP_PER_SECTOR) used = FLASH_STORE_CAP_PER_SECTOR;
+    for (uint32_t i = 0; i < used; i++) {
+        uint32_t addr = base + FLASH_STORE_SECTOR_HDR + i * FLASH_STORE_REC_SIZE;
+        FS_Record_t rec;
+        if (FS_UnpackRecord((const uint8_t*)addr, &rec) == 0 && rec.boot_id > boot) {
+            boot = rec.boot_id;
+        }
+    }
+    return boot;
 }
 
 /* 追加写一个 boot_id 到指定元数据扇区；返回写入槽序号，满/失败返回-1。
@@ -354,10 +419,11 @@ static int FS_MetaBlank(uint32_t base, uint32_t cap)
    写入后回读 boot_id/generation/CRC 三项，全部一致才算成功。 */
 static int FS_MetaAppend(uint32_t base, uint32_t cap, uint32_t boot, uint32_t gen)
 {
-    /* 找第一个空槽 */
+    /* 找第一个"整条"空槽（槽首 FF 但槽尾脏的槽不可用：对它编程会失败，
+       也会让 FS_ScanUsed 之类的顺序假设失效） */
     uint32_t slot = 0xFFFFFFFF;
     for (uint32_t k = 0; k < cap; k++) {
-        if (*(volatile uint32_t*)(base + k*FS_META_REC_SIZE) == 0xFFFFFFFF) { slot = k; break; }
+        if (FS_MetaSlotBlank(base + k * FS_META_REC_SIZE)) { slot = k; break; }
     }
     if (slot == 0xFFFFFFFF) return -1;   /* 满 */
     uint32_t addr = base + slot * FS_META_REC_SIZE;
@@ -476,7 +542,33 @@ FS_IdentState_t FS_IdentityState(void) { return s_ident_state; }
 bool FS_IdentityRepair(uint32_t min_boot_id)
 {
     if (min_boot_id == 0xFFFFFFFFu) return false;   /* 上溢保护 */
-    uint32_t nb = min_boot_id + 1;
+
+    /* 【恢复下限】恢复只能往前走，绝不能倒退。
+       下限 = max(人工给定下限,
+                  内存中的当前编号,
+                  两个元数据扇区里 CRC 有效记录的最大编号,
+                  活动数据区里 CRC 有效记录的最大编号)。
+       任一项都必须在擦除之前读完、判完：先擦后校验的写法一旦判断有误，
+       旧编号就已经没了，不能回滚。
+       数据区那一项是关键兜底：元数据可能整片丢失，但数据区里的记录还留着
+       "这台机器用到过哪个编号"的证据。 */
+    uint32_t floor_boot = min_boot_id;
+    if (s_boot_id > floor_boot) floor_boot = s_boot_id;
+
+    uint32_t max_a = FS_MaxBootInSector(FS_SECTOR4_ADDR, FS_META_CAP_A);
+    uint32_t max_b = FS_MaxBootInSector(FS_SECTOR7_ADDR, FS_META_CAP_B);
+    if (max_a > floor_boot) floor_boot = max_a;
+    if (max_b > floor_boot) floor_boot = max_b;
+
+    if (s_data_ready) {
+        uint32_t max_d = FS_MaxBootInData(s_act_data_addr, s_used);
+        if (max_d > floor_boot) floor_boot = max_d;
+    }
+
+    if (min_boot_id < floor_boot) return false;     /* 拒绝编号倒退 */
+    if (floor_boot == 0xFFFFFFFFu) return false;    /* 上溢保护 */
+
+    uint32_t nb = floor_boot + 1;
 
     /* 先擦 A 并写入新编号，再处理 B：任一步掉电都至少保留一份有效编号 */
     if (FS_EraseSector(FLASH_STORE_SECTOR_META_A) != 0) return false;
@@ -543,16 +635,19 @@ FS_Err_t FS_Append(const FS_Record_t *rec)
              于是【每写一条新记录都触发一次整扇区迁移】
              （擦 128KB + 重写约 130KB）。按 10s 节律约 11 天就能磨穿
              一个数据扇区的擦写寿命，而且每次迁移都会阻塞主循环约 1 秒。
-             丢 1/8 之后，可以再安稳定写入约 255 条才需要下一次迁移。 */
+             丢 1/8 之后，可以再安稳定写入约 255 条才需要下一次迁移。
+           【顺序】必须"先迁移、成功后才丢"：旧实现先砍 RAM 队列再调 Recycle，
+           一旦 Recycle 中途失败（擦除/编程出错），那 255 条就同时从 RAM 和
+           上传队列里消失，而 Flash 里明明还在 —— 属于静默丢数据。
+           现在把 first=drop 传给迁移：迁移只复制保留部分，失败时队列与
+           Flash 都保持原样，一条不丢。 */
         uint32_t drop = FS_RAM_CAP / 8;
         if (drop == 0) drop = 1;
-        if (drop > s_q_count) drop = s_q_count;
-        s_dropped += drop;
-        memmove(&s_queue[0], &s_queue[drop], (s_q_count - drop) * sizeof(FS_SlotIdx_t));
-        s_q_count -= drop;
-        if (FS_Recycle() != FS_OK) {
-            return FS_ERR_FULL;     /* 回收失败：旧扇区仍完整，本次不写入 */
+        if (drop >= s_q_count) drop = 1;
+        if (FS_RecycleFrom(drop) != FS_OK) {
+            return FS_ERR_FULL;     /* 回收失败：旧扇区与队列都完整，本次不写入 */
         }
+        s_dropped += drop;
     }
     /* 判断活动扇区是否写满（用 RAM 维护的 s_used，不读/写 hdr.used） */
     if (s_used >= FLASH_STORE_CAP_PER_SECTOR) {
@@ -592,18 +687,32 @@ void FS_MarkConfirmed(uint32_t boot_id, uint32_t seq)
             uint32_t addr = s_act_data_addr + FLASH_STORE_SECTOR_HDR
                           + s_queue[i].slot * FLASH_STORE_REC_SIZE;
             /* 确认字独占 [60..63]，只编程这一次（0xFFFFFFFF→0），不动其余字节。
-               编程前必须是擦除态，否则说明该 word 已编程过（重复 ACK / 旧格式），
-               直接跳过，避免 F4 上对同一 word 二次编程。 */
-            if (*(volatile uint32_t *)(addr + 60) == 0xFFFFFFFFu &&
-                FS_ProgWord(addr + 60, 0x00000000u) == 0) {
-                uint32_t cw;
-                memcpy(&cw, (const void *)(addr + 60), 4);
-                if (cw == 0x00000000u &&
+               编程前先判三态，避免对同一 word 二次编程（F4 会直接拒绝）。 */
+            uint32_t cw = 0;
+            memcpy(&cw, (const void *)(addr + 60), 4);
+            int cs = FS_ConfirmState(cw);
+
+            if (cs == FS_CONFIRM_DONE) {
+                s_queue[i].confirmed = 1;      /* 重复 ACK：早已确认 */
+            } else if (cs == FS_CONFIRM_BAD) {
+                /* 确认字已写坏（此前写确认字时掉电）。ACK 已经收到，数据在云端，
+                   按已确认出队 —— 否则每次 ACK 都会走到这里、每次都被 F4 拒绝，
+                   这条记录永远出不了队，还会跟着迁移反复重发。 */
+                s_queue[i].confirmed = 1;
+            } else if (FS_ProgWord(addr + 60, 0x00000000u) == 0) {
+                uint32_t rw;
+                memcpy(&rw, (const void *)(addr + 60), 4);
+                if (rw == 0x00000000u &&
                     *(const volatile uint8_t *)(addr + 55) == 0x00) {
                     s_queue[i].confirmed = 1;
                 }
+            } else {
+                /* 编程失败：重新读一次确认字。
+                   - 仍是全 FF（根本没写进去）→ 保留待确认，下次 ACK 重试；
+                   - 变成坏值（掉电把 word 写了一部分）→ 按已确认处理。 */
+                memcpy(&cw, (const void *)(addr + 60), 4);
+                if (FS_ConfirmState(cw) == FS_CONFIRM_BAD) s_queue[i].confirmed = 1;
             }
-            /* 写/回读失败：保留未确认，等下次 ACK 再试（记录不丢） */
             break;
         }
     }
@@ -667,25 +776,31 @@ bool FS_ReadById(uint32_t boot_id, uint32_t seq, FS_Record_t *rec)
 uint32_t FS_PendingCount(void) { return s_q_count; }
 uint32_t FS_DroppedCount(void) { return s_dropped; }
 
-FS_Err_t FS_Recycle(void)
+static FS_Err_t FS_RecycleFrom(uint32_t first)
 {
     if (!s_data_ready) return FS_ERR_NOTREADY;
+    if (first > s_q_count) first = s_q_count;
+    uint32_t keep = s_q_count - first;
 
     /* 目标扇区 = 另一个数据扇区 */
     uint32_t target = (s_act_data_addr == FS_SECTOR5_ADDR) ? FS_SECTOR6_ADDR
                                                            : FS_SECTOR5_ADDR;
     uint32_t new_gen = s_act_data_gen + 1;
 
-    /* 复制保留数据到目标；失败则保留旧扇区不动（契约 §10.5：先复制校验，再擦旧） */
-    int32_t copied = FS_CopyPendingTo(target, new_gen);
+    /* 复制保留数据到目标；失败则保留旧扇区不动（契约 §10.5：先复制校验，再擦旧）。
+       失败时 RAM 队列也一条未改 —— 调用方不会误以为自己已经丢了记录。 */
+    int32_t copied = FS_CopyPendingTo(target, new_gen, first, keep);
     if (copied < 0) {
         return FS_ERR_CRC;          /* 旧扇区仍完整，下次可重试 */
     }
 
     /* 复制成功后才重排槽号；新扇区占用槽位数 = 保留条数 */
-    for (uint32_t i = 0; i < s_q_count; i++) {
-        s_queue[i].slot = i;
+    for (uint32_t i = 0; i < keep; i++) {
+        s_queue[i] = s_queue[first + i];
+        s_queue[i].slot      = i;
+        s_queue[i].confirmed = 0;
     }
+    s_q_count = keep;
     s_used = (uint32_t)copied;
 
     /* 擦旧扇区（数据已在新扇区提交；擦除失败不影响本次切换） */
@@ -698,3 +813,5 @@ FS_Err_t FS_Recycle(void)
     s_generation    = new_gen;
     return FS_OK;
 }
+
+FS_Err_t FS_Recycle(void) { return FS_RecycleFrom(0); }

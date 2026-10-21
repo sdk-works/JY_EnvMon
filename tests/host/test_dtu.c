@@ -28,6 +28,8 @@ extern uint32_t flash_sim_erases(void);
 extern void     flash_sim_poke(uint32_t addr, const uint8_t *data, uint32_t len);
 extern uint32_t flash_sim_nonblank(uint32_t addr, uint32_t len);
 extern int      g_sim_erase_fail;
+extern void     flash_sim_fail_program_after(uint32_t n);
+extern void     flash_sim_partial_program_once(void);
 
 #define SECTOR4_ADDR  0x08010000u
 #define SECTOR5_ADDR  0x08020000u
@@ -502,6 +504,231 @@ static void case_many_records(void)
     ck(Dtu_LastBootId() == 1, "同一启动内 boot_id 不变");
 }
 
+/* ============================================================
+ * 第三方审查 1d48590 三项发现 + 满缓存/掉电回归
+ * ============================================================ */
+
+/* 直接向缓存追加一条记录（绕过 Dtu 采样节律，用于存储层压测） */
+static int append_seq(uint32_t boot, uint32_t seq, uint32_t temp)
+{
+    FS_Record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.boot_id     = boot;
+    rec.seq         = seq;
+    rec.sampled_at  = 1700000000u + seq;
+    rec.uptime_ms   = (uint64_t)seq * 10000u;
+    rec.time_quality= 1;
+    rec.valid       = 0x01;
+    rec.data[FS_CH_TEMPERATURE] = temp;
+    return (FS_Append(&rec) == FS_OK);
+}
+
+/* 14. 元数据"空白"必须整条判定（审查 P1-1）
+   构造"槽首 word 为 FF、槽尾有残留"的元数据：旧实现只查首 word，会把它
+   当成首次使用并从 1 重新编号 → 与云端历史 msg_id 撞号。 */
+static void case_review_meta_nonblank_tail(void)
+{
+    uint8_t dirty[4] = {0, 0, 0, 0};
+
+    begin("review_meta_nonblank_tail");
+    flash_sim_reset();
+    flash_sim_poke(SECTOR4_ADDR + 4, dirty, 4);      /* 槽 0 首 word 仍全 FF */
+    Dtu_Init();
+
+    ck(FS_IdentityState() == FS_IDENT_CORRUPT, "槽首 FF、槽尾有残留不得判为空白");
+    ck(FS_NextBootId() == 0, "身份损坏时禁止自动编号");
+    ck(Dtu_LastBootId() == 0, "身份损坏时 boot_id 应为 0");
+    ck(Dtu_IdentityOk() == 0, "身份损坏时身份不就绪");
+    adv(3 * DTU_NEW_RECORD_MS);
+    Dtu_Tick();
+    ck(Dtu_PendingCount() == 0, "身份损坏时不得生成新记录");
+
+    /* 远端槽（第 100 条记录位置）残留，同样必须判为损坏 */
+    flash_sim_reset();
+    flash_sim_poke(SECTOR7_ADDR + 100 * 32 + 12, dirty, 4);
+    Dtu_Init();
+    ck(FS_IdentityState() == FS_IDENT_CORRUPT, "远端槽残留同样必须判为损坏");
+    ck(Dtu_LastBootId() == 0, "远端槽残留时同样禁止自动编号");
+
+    /* 反向：真正全空白的扇区仍应走首次使用（状态 BLANK，编号从 1 开始） */
+    flash_sim_reset();
+    Dtu_Init();
+    ck(FS_IdentityState() == FS_IDENT_BLANK, "全空白应判为首次使用（BLANK）");
+    ck(Dtu_LastBootId() == 1, "首次使用编号为 1");
+
+    /* 已有有效编号 + 一个"槽尾脏"的坏槽：必须跳过坏槽继续追加，不能卡死 */
+    flash_sim_poke(SECTOR4_ADDR + 32 + 8, dirty, 4);   /* 槽 1 的 CRC 位置被写脏 */
+    ck(FS_NextBootId() == 2, "遇到槽尾脏的坏槽应跳过并继续追加编号");
+    ck(FS_IdentityState() != FS_IDENT_CORRUPT, "跳槽追加后身份不得为损坏态");
+    FS_Init();
+    ck(FS_GetBootId() == 2, "跳槽写入的编号应可持久恢复");
+    ck(flash_sim_reprogram() == 0, "身份判定过程不得二次编程");
+}
+
+/* 15. 身份修复不允许编号倒退（审查 P1-2） */
+static void case_review_repair_monotonic(void)
+{
+    begin("review_repair_monotonic");
+    flash_sim_reset();
+    Dtu_Init();                       /* boot 1 */
+    ck(FS_NextBootId() == 2, "setup: boot 2");
+    ck(FS_NextBootId() == 3, "setup: boot 3");
+    ck(FS_GetBootId() == 3, "setup: 当前编号 3");
+
+    ck(!FS_IdentityRepair(0), "必须拒绝低于已知编号的恢复下限");
+    ck(!FS_IdentityRepair(2), "必须拒绝任何倒退请求");
+    ck(FS_GetBootId() == 3, "拒绝后编号必须保持 3");
+    ck(FS_IdentityState() == FS_IDENT_BLANK, "拒绝后身份状态不变（仍为首次使用态）");
+
+    ck(FS_IdentityRepair(9), "高于已知编号的恢复应成功");
+    ck(FS_GetBootId() == 10, "新编号 = 下限 + 1");
+    ck(FS_IdentityState() == FS_IDENT_OK, "修复后身份有效");
+
+    FS_Init();
+    ck(FS_GetBootId() == 10, "恢复结果必须持久化");
+    Dtu_Init();
+    ck(Dtu_LastBootId() == 11, "重启后应在此基础上递增");
+    ck(flash_sim_reprogram() == 0, "修复过程不得二次编程");
+}
+
+/* 16. 确认字写坏后必须能出队（审查 P2）
+   确认字只接受全 FF 时，掉电写坏的 word（既非 FF 也非 0）会让后续 ACK
+   永远跳过写入 → 同一条记录无限重发、永远出不了队。 */
+static void case_confirm_word_corrupt(void)
+{
+    FS_Record_t rr;
+    uint8_t bad[4] = {0x00, 0xFF, 0x00, 0x00};        /* 0x0000FF00：半成品 */
+    uint32_t addr  = SECTOR5_ADDR + 256;              /* 首条记录 */
+
+    begin("confirm_word_corrupt");
+    flash_sim_reset();
+    Dtu_Init();
+    ck(append_seq(1, 1, 123), "前置：写入 1 条待发记录");
+
+    /* A：确认字已被写坏（掉电遗留） */
+    flash_sim_poke(addr + 60, bad, 4);
+    FS_MarkConfirmed(1, 1);
+    ck(FS_PendingCount() == 0, "确认字损坏时 ACK 必须能出队（不得无限重发）");
+    ck(flash_sim_reprogram() == 0, "不得对写坏的确认字二次编程");
+
+    /* A2：重启后该记录不得重新排进待发队列 */
+    FS_Init();
+    ck(FS_PendingCount() == 0, "重启后不得把确认字损坏的记录重新排队");
+    ck(!FS_Peek(&rr, true), "重启后队列应为空");
+
+    /* B：写确认字途中掉电（HAL 已写坏一部分后才失败） */
+    flash_sim_reset();
+    Dtu_Init();
+    ck(append_seq(1, 1, 55), "前置：再写 1 条");
+    flash_sim_partial_program_once();
+    FS_MarkConfirmed(1, 1);
+    ck(FS_PendingCount() == 0, "写确认字途中掉电也必须能出队");
+
+    /* C：完全没写进去（确认字仍是 FF）→ 保留待确认，下次 ACK 重试 */
+    flash_sim_reset();
+    Dtu_Init();
+    ck(append_seq(1, 1, 66), "前置：再写 1 条");
+    flash_sim_fail_program_after(0);
+    FS_MarkConfirmed(1, 1);
+    ck(FS_PendingCount() == 1, "完全没写进去时应保留待确认");
+    FS_MarkConfirmed(1, 1);                            /* 重试 */
+    ck(FS_PendingCount() == 0, "重试 ACK 应能正常确认出队");
+    ck(flash_sim_reprogram() == 0, "三段场景均不得二次编程");
+}
+
+/* 17. 满缓存 2044 条 + 批量丢弃 + 整扇区迁移 + 重启恢复 */
+static void case_full_cache_migration(void)
+{
+    FS_Record_t rr;
+    uint32_t before;
+    int i;
+    const int CAP = (int)FLASH_STORE_CAP_PER_SECTOR;   /* 2044 */
+
+    begin("full_cache_migration");
+    flash_sim_reset();
+    Dtu_Init();
+    ck(FS_PendingCount() == 0, "初始队列为空");
+
+    for (i = 0; i < CAP; i++) {
+        if (!append_seq(1, (uint32_t)i + 1, 200u + (uint32_t)i)) break;
+    }
+    ck(i == CAP, "应能连续写入 2044 条");
+    ck(FS_PendingCount() == (uint32_t)CAP, "满缓存应为 2044 条待发");
+    ck(flash_sim_erases() == 1, "填满过程只应有首次建扇区的 1 次擦除");
+
+    /* 第 2045 条：触发"丢最旧 1/8 + 整扇区迁移" */
+    before = flash_sim_erases();
+    ck(append_seq(1, (uint32_t)CAP + 1, 900), "满队列仍应接受新记录");
+    ck(flash_sim_erases() == before + 2, "迁移 = 擦目标扇区 + 擦旧扇区");
+    ck(FS_DroppedCount() == (uint32_t)(CAP / 8), "应丢弃最旧 1/8 = 255 条");
+    ck(FS_PendingCount() == (uint32_t)(CAP - CAP / 8 + 1), "保留条数 = 2044-255+1");
+
+    /* 丢的是最旧的一批，保留记录内容完好 */
+    ck(!FS_ReadById(1, 1, &rr), "seq1 应已丢弃");
+    ck(!FS_ReadById(1, 255, &rr), "seq255 应已丢弃");
+    ck(FS_ReadById(1, 256, &rr), "seq256 应保留");
+    ck(rr.seq == 256 && rr.data[FS_CH_TEMPERATURE] == 455u, "保留记录内容必须完好");
+    ck(FS_ReadById(1, (uint32_t)CAP + 1, &rr), "最新记录应保留");
+    ck(flash_sim_reprogram() == 0, "迁移过程不得对同一 word 二次编程");
+
+    /* 迁移后还能稳定写 254 条而不触发新迁移（否则又是每条一迁移 → 磨穿扇区） */
+    before = flash_sim_erases();
+    for (i = 0; i < 254; i++) {
+        if (!append_seq(1, (uint32_t)CAP + 2 + (uint32_t)i, 1000u + (uint32_t)i)) break;
+    }
+    ck(i == 254, "迁移后应还能写 254 条");
+    ck(flash_sim_erases() == before, "这 254 条不应触发迁移");
+    ck(FS_PendingCount() == (uint32_t)CAP, "此时又回到满缓存");
+
+    /* 断电重启：新扇区被选中，记录数与内容完整恢复 */
+    FS_Init();
+    ck(FS_PendingCount() == (uint32_t)CAP, "重启后记录数应完整恢复");
+    ck(FS_ReadById(1, 256, &rr), "重启后最旧保留记录仍在");
+    ck(FS_ReadById(1, (uint32_t)CAP + 255, &rr), "重启后最新记录仍在");
+    ck(FS_GetBootId() == 1, "单纯 FS_Init 不应改变编号");
+    ck(flash_sim_reprogram() == 0, "重启扫描不得产生编程");
+}
+
+/* 18. 迁移过程中掉电：旧扇区必须完整、一条不丢 */
+static void case_power_loss_in_migration(void)
+{
+    FS_Record_t rec, rr;
+    int i;
+    const int CAP = (int)FLASH_STORE_CAP_PER_SECTOR;
+
+    begin("power_loss_in_migration");
+    flash_sim_reset();
+    Dtu_Init();
+    for (i = 0; i < CAP; i++) {
+        if (!append_seq(1, (uint32_t)i + 1, 10u)) break;
+    }
+    ck(i == CAP, "前置：填满 2044 条");
+
+    memset(&rec, 0, sizeof(rec));
+    rec.boot_id = 1; rec.seq = (uint32_t)CAP + 1; rec.valid = 0x01;
+
+    /* 迁移动到第 600 个 word 时掉电（目标扇区已擦、头已写、记录只复制了一部分） */
+    flash_sim_fail_program_after(600);
+    ck(FS_Append(&rec) == FS_ERR_FULL, "迁移中途掉电应返回 FS_ERR_FULL");
+    ck(FS_PendingCount() == (uint32_t)CAP, "失败时 RAM 队列一条都不能少");
+    ck(FS_DroppedCount() == 0, "失败时不得计丢弃");
+    ck(FS_ReadById(1, 1, &rr), "失败后旧扇区仍可读");
+
+    /* 断电重启：必须回到旧扇区，记录完整 */
+    FS_Init();
+    ck(FS_PendingCount() == (uint32_t)CAP, "重启后记录数不变");
+    ck(FS_ReadById(1, 1, &rr) && rr.seq == 1, "重启后最旧记录仍在");
+    ck(FS_ReadById(1, (uint32_t)CAP, &rr) && rr.seq == (uint32_t)CAP, "重启后最新记录仍在");
+    ck(flash_sim_reprogram() == 0, "掉电重来不得触发二次编程");
+
+    /* 恢复后还能正常迁移 */
+    ck(append_seq(1, (uint32_t)CAP + 1, 777u), "恢复后应能继续写入");
+    ck(FS_DroppedCount() == (uint32_t)(CAP / 8), "恢复后丢弃计数应为 255");
+    ck(FS_ReadById(1, (uint32_t)CAP + 1, &rr), "恢复后新记录可读");
+    ck(FS_PendingCount() == (uint32_t)(CAP - CAP / 8 + 1), "恢复后条数正确");
+    ck(flash_sim_reprogram() == 0, "恢复迁移不得二次编程");
+}
+
 /* ============================================================ */
 int main(void)
 {
@@ -523,6 +750,11 @@ int main(void)
     case_identity_corrupt();
     case_storage_not_ready();
     case_many_records();
+    case_review_meta_nonblank_tail();
+    case_review_repair_monotonic();
+    case_confirm_word_corrupt();
+    case_full_cache_migration();
+    case_power_loss_in_migration();
 
     fprintf(g_out, "\n===== RESULT: %d passed, %d failed =====\n", g_pass, g_fail);
     fprintf(g_out, "flash program ops = %u, erase ops = %u, reprogram violations = %u\n",
