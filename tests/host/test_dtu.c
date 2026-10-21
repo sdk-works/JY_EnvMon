@@ -591,9 +591,10 @@ static void case_review_repair_monotonic(void)
     ck(flash_sim_reprogram() == 0, "修复过程不得二次编程");
 }
 
-/* 16. 确认字写坏后必须能出队（审查 P2）
-   确认字只接受全 FF 时，掉电写坏的 word（既非 FF 也非 0）会让后续 ACK
-   永远跳过写入 → 同一条记录无限重发、永远出不了队。 */
+/* 16. 确认字状态不确定时：保留补传资格 + 换槽恢复可写（审查 P2 修正版）
+   规则：FF=待确认、00=已确认、其它=不确定（仍需补传）。
+   不确定值绝不能当成"已确认"—— 云端按 msg_id 幂等去重，重复可处理；漏传不可补救。
+   恢复路径：把记录复制到新槽（确认字为擦除态），再写确认字、出队。 */
 static void case_confirm_word_corrupt(void)
 {
     FS_Record_t rr;
@@ -605,35 +606,54 @@ static void case_confirm_word_corrupt(void)
     Dtu_Init();
     ck(append_seq(1, 1, 123), "前置：写入 1 条待发记录");
 
-    /* A：确认字已被写坏（掉电遗留） */
+    /* A：确认字是不确定值 → 必须仍算待发（不得当成已确认丢掉） */
     flash_sim_poke(addr + 60, bad, 4);
-    FS_MarkConfirmed(1, 1);
-    ck(FS_PendingCount() == 0, "确认字损坏时 ACK 必须能出队（不得无限重发）");
-    ck(flash_sim_reprogram() == 0, "不得对写坏的确认字二次编程");
-
-    /* A2：重启后该记录不得重新排进待发队列 */
     FS_Init();
-    ck(FS_PendingCount() == 0, "重启后不得把确认字损坏的记录重新排队");
-    ck(!FS_Peek(&rr, true), "重启后队列应为空");
+    ck(FS_PendingCount() == 1, "确认字不确定必须仍保留补传资格");
 
-    /* B：写确认字途中掉电（HAL 已写坏一部分后才失败） */
+    /* A2：ACK 到达 → 换槽恢复可写并确认出队 */
+    FS_MarkConfirmed(1, 1);
+    ck(FS_PendingCount() == 0, "换槽后写确认字应能出队");
+    ck(flash_sim_reprogram() == 0, "不得对不确定的确认字二次编程");
+
+    /* A3：重启后既不能复活，也不能重复补传 */
+    FS_Init();
+    ck(FS_PendingCount() == 0, "重启后不得复活已确认记录");
+    ck(!FS_Peek(&rr, true), "队列应为空");
+
+    /* A4：换槽确实多占了一个槽（迁移/去重逻辑的前提） */
+    ck(flash_sim_nonblank(SECTOR5_ADDR + 256 + 64, 8) > 0, "新槽应已写入副本");
+
+    /* B：写确认字途中掉电（HAL 只写了一半）→ 不确定 → 仍待发 */
     flash_sim_reset();
     Dtu_Init();
     ck(append_seq(1, 1, 55), "前置：再写 1 条");
     flash_sim_partial_program_once();
     FS_MarkConfirmed(1, 1);
-    ck(FS_PendingCount() == 0, "写确认字途中掉电也必须能出队");
+    ck(FS_PendingCount() == 1, "写确认字途中掉电应保留补传资格");
+    FS_MarkConfirmed(1, 1);                            /* ACK 重发后再来一次 */
+    ck(FS_PendingCount() == 0, "再收到 ACK 后应换槽确认成功");
+    ck(flash_sim_reprogram() == 0, "全程不得二次编程");
 
-    /* C：完全没写进去（确认字仍是 FF）→ 保留待确认，下次 ACK 重试 */
+    /* C：完全没写进去（确认字仍是 FF）→ 待确认，重试即可 */
     flash_sim_reset();
     Dtu_Init();
     ck(append_seq(1, 1, 66), "前置：再写 1 条");
     flash_sim_fail_program_after(0);
     FS_MarkConfirmed(1, 1);
-    ck(FS_PendingCount() == 1, "完全没写进去时应保留待确认");
-    FS_MarkConfirmed(1, 1);                            /* 重试 */
+    ck(FS_PendingCount() == 1, "没写进去时应保留待确认");
+    FS_MarkConfirmed(1, 1);
     ck(FS_PendingCount() == 0, "重试 ACK 应能正常确认出队");
-    ck(flash_sim_reprogram() == 0, "三段场景均不得二次编程");
+
+    /* D：不确定状态也能靠整扇区迁移修好（迁移写出的是干净确认字） */
+    flash_sim_reset();
+    Dtu_Init();
+    ck(append_seq(1, 1, 77), "前置：再写 1 条");
+    flash_sim_poke(SECTOR5_ADDR + 256 + 60, bad, 4);
+    ck(FS_Recycle() == FS_OK, "迁移应成功");
+    FS_MarkConfirmed(1, 1);
+    ck(FS_PendingCount() == 0, "迁移到新扇区后确认字可写，ACK 应能出队");
+    ck(flash_sim_reprogram() == 0, "迁移路径不得二次编程");
 }
 
 /* 17. 满缓存 2044 条 + 批量丢弃 + 整扇区迁移 + 重启恢复 */

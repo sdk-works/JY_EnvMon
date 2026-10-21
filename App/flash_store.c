@@ -16,9 +16,10 @@
  *   - FS_IdentityRepair 增加单调性下限：min_boot_id 低于已知最大编号一律拒绝，
  *     下限 = max(人工下限, 内存编号, 两元数据扇区有效最大, 活动数据区有效最大)，
  *     且全部校验在擦除之前完成，杜绝 3→1 这种编号倒退；
- *   - 确认字三态化（FF=待确认 / 00=已确认 / 其它=写坏）：写坏说明当初写确认字
- *     时掉电、而 ACK 已经收到，按已确认出队，避免"每次 ACK 都被 F4 拒绝 →
- *     同一条记录永远出不了队"；
+ *   - 确认字三态且"不确定 = 仍需补传"（FF=待确认 / 00=已确认 / 其它=不确定）：
+ *     不确定值一律保留补传资格，绝不当成已确认 —— 云端按 msg_id 幂等去重，
+ *     重复上传可处理；误判成功造成漏传则无法补救。不确定状态通过"迁移到新槽"
+ *     恢复可写状态（新槽确认字为擦除态），再重发等 ACK；
  *   - 队列满时先迁移、成功后才丢掉最旧 1/8（原实现先丢后迁移，迁移失败会
  *     静默丢掉 255 条已持久化记录）。
   *
@@ -149,20 +150,28 @@ static void FS_PackRecord(const FS_Record_t *r, uint8_t out[FLASH_STORE_REC_SIZE
        写入时保持擦除态（跳过编程），等 ACK 到达再一次性编程为 0。 */
 }
 
-/* 确认字三态。第三态（既非全 FF 也非全 0）只可能来自"写确认字时掉电"：
-   该 word 被编程了一部分。F4 不允许对同一 word 二次编程，所以它既不能被
-   补写成 0，也不能被改回 FF —— 只能按"已确认"处理。
-   语义依据：确认字只在本机收到 status=stored 的 ACK 后才编程，因此看到
-   半个 0 就意味着那次 ACK 确实到过本机，数据已在云端。 */
+/* 确认字三态。第三态（既非全 FF 也非全 0）= 状态不确定：
+   可能是写确认字时掉电留下的半成品，也可能是位翻转。两种成因都无法排除，
+   因此【不能】推断"ACK 已收到"。
+   取舍：云端按 msg_id 幂等去重，重复上传可处理；误判成功导致漏传无法补救。
+   所以不确定一律保留补传资格，靠"迁移到新槽"恢复可写确认状态后重发。 */
 #define FS_CONFIRM_PRISTINE  0   /* 0xFFFFFFFF 待确认，可编程 */
 #define FS_CONFIRM_DONE      1   /* 0x00000000 已确认 */
-#define FS_CONFIRM_BAD       2   /* 其它值：写确认字时掉电，字已写坏 */
+#define FS_CONFIRM_BAD       2   /* 其它值：状态不确定，仍需补传 */
 
 static int FS_ConfirmState(uint32_t confirm_word)
 {
     if (confirm_word == 0xFFFFFFFFu) return FS_CONFIRM_PRISTINE;
     if (confirm_word == 0x00000000u) return FS_CONFIRM_DONE;
     return FS_CONFIRM_BAD;
+}
+
+/* 读某个记录槽的确认字状态 */
+static int FS_ConfirmStateAt(uint32_t rec_addr)
+{
+    uint32_t cw;
+    memcpy(&cw, (const void *)(rec_addr + 60), 4);
+    return FS_ConfirmState(cw);
 }
 
 /* 解包 + 校验 CRC */
@@ -183,12 +192,11 @@ static int FS_UnpackRecord(const uint8_t in[FLASH_STORE_REC_SIZE], FS_Record_t *
     memcpy(r->data, &in[22], FS_CH_NUM * 4);
     /* 已确认判定：新格式看独立确认字[60..63]；
        旧格式（[54] 被编程为 0x00）依然兼容读出为已确认。
-       确认字写坏（FS_CONFIRM_BAD）按已确认处理，理由见 FS_ConfirmState 注释：
-       否则这条记录会被无限重发，且每次 ACK 都试图对同一 word 二次编程。 */
+       注意：确认字为"不确定值"时【不算已确认】—— 保守策略见 FS_ConfirmState。 */
     uint32_t confirm_word;
     memcpy(&confirm_word, &in[60], 4);
     r->confirmed = (in[54] != 0xFF) ||
-                   (FS_ConfirmState(confirm_word) != FS_CONFIRM_PRISTINE);
+                   (FS_ConfirmState(confirm_word) == FS_CONFIRM_DONE);
     return 0;
 }
 
@@ -270,6 +278,24 @@ static int FS_SlotBlank(uint32_t addr)
     return 1;
 }
 
+/* 在 [from..used) 槽范围内找出同一 (boot_id, seq) 的"更靠后的副本"。
+   确认字不确定的记录会被搬到更靠后的新槽（见 FS_RelocateSlot），旧槽仍留在
+   原地且 CRC 有效；重启扫描时若两条都载入队列，同一条数据会被当成两条补传。
+   记录是顺序追加的，(boot_id, seq) 不会合法地重复出现，所以"靠后的为准"。 */
+static int FS_HasLaterCopy(uint32_t base, uint32_t from, uint32_t used,
+                           uint32_t boot, uint32_t seq)
+{
+    for (uint32_t i = from; i < used; i++) {
+        uint32_t addr = base + FLASH_STORE_SECTOR_HDR + i * FLASH_STORE_REC_SIZE;
+        FS_Record_t r;
+        if (FS_UnpackRecord((const uint8_t*)addr, &r) == 0 &&
+            r.boot_id == boot && r.seq == seq) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* 从指定数据扇区恢复 RAM 队列索引（只载入未确认记录） */
 static uint32_t FS_LoadDataSector(uint32_t base, uint32_t used)
 {
@@ -278,6 +304,12 @@ static uint32_t FS_LoadDataSector(uint32_t base, uint32_t used)
         uint32_t addr = base + FLASH_STORE_SECTOR_HDR + i * FLASH_STORE_REC_SIZE;
         FS_Record_t rec;
         if (FS_UnpackRecord((const uint8_t*)addr, &rec) == 0 && !rec.confirmed) {
+            /* 确认字不确定的记录保留补传资格；但若它已经被搬到更靠后的槽，
+               这里的旧槽就是陈旧副本，跳过（否则会重复补传同一 (boot,seq)）。 */
+            if (FS_ConfirmStateAt(addr) == FS_CONFIRM_BAD &&
+                FS_HasLaterCopy(base, i + 1, used, rec.boot_id, rec.seq)) {
+                continue;
+            }
             s_queue[s_q_count].slot     = i;
             s_queue[s_q_count].boot_id  = rec.boot_id;
             s_queue[s_q_count].seq      = rec.seq;
@@ -286,6 +318,43 @@ static uint32_t FS_LoadDataSector(uint32_t base, uint32_t used)
         }
     }
     return s_q_count;
+}
+
+/* 把队列第 idx 条记录复制到一个干净新槽，并把索引改指新槽。
+   触发条件：原槽的确认字是"不确定值"——那个 word 既不能补写成 0、也不能改回 FF
+   （F4 禁止同 word 二次编程），只能换一个槽才能重新获得可写确认状态。
+   旧槽留在原地成为陈旧副本：重启扫描时由 FS_HasLaterCopy 去重，
+   下一次整扇区迁移时自然消失（迁移只复制队列里的记录）。
+   返回 0 成功。失败时队列不变，该记录继续保留补传资格。 */
+static int FS_RelocateSlot(uint32_t idx)
+{
+    /* 扇区已满时不在 ACK 路径上做迁移：迁移会重排队列索引，且队列满时
+       迁移后仍然无处可写。保留补传资格，等下一次采样触发正常回收
+       （回收会把 pending 记录写进新扇区，确认字天然可写）后再确认。 */
+    if (s_used >= FLASH_STORE_CAP_PER_SECTOR) return -1;
+
+    FS_Record_t rec;
+    uint32_t src = s_act_data_addr + FLASH_STORE_SECTOR_HDR
+                 + s_queue[idx].slot * FLASH_STORE_REC_SIZE;
+    if (FS_UnpackRecord((const uint8_t*)src, &rec) != 0) return -1;
+
+    uint32_t slot = s_used;
+    uint32_t dst  = s_act_data_addr + FLASH_STORE_SECTOR_HDR
+                  + slot * FLASH_STORE_REC_SIZE;
+    rec.confirmed = false;
+    if (FS_WriteRecordToFlash(dst, &rec) != 0) {
+        if (!FS_SlotBlank(dst)) s_used = slot + 1;   /* 半成品槽：跳过，不覆盖 */
+        return -1;
+    }
+    FS_Record_t chk;
+    if (FS_UnpackRecord((const uint8_t*)dst, &chk) != 0 ||
+        chk.boot_id != rec.boot_id || chk.seq != rec.seq) {
+        if (!FS_SlotBlank(dst)) s_used = slot + 1;
+        return -1;
+    }
+    s_used = slot + 1;
+    s_queue[idx].slot = slot;
+    return 0;
 }
 
 /* 把未确认记录从源(活动)扇区复制到目标扇区并更新头（迁移用）。
@@ -695,23 +764,28 @@ void FS_MarkConfirmed(uint32_t boot_id, uint32_t seq)
             if (cs == FS_CONFIRM_DONE) {
                 s_queue[i].confirmed = 1;      /* 重复 ACK：早已确认 */
             } else if (cs == FS_CONFIRM_BAD) {
-                /* 确认字已写坏（此前写确认字时掉电）。ACK 已经收到，数据在云端，
-                   按已确认出队 —— 否则每次 ACK 都会走到这里、每次都被 F4 拒绝，
-                   这条记录永远出不了队，还会跟着迁移反复重发。 */
-                s_queue[i].confirmed = 1;
-            } else if (FS_ProgWord(addr + 60, 0x00000000u) == 0) {
-                uint32_t rw;
-                memcpy(&rw, (const void *)(addr + 60), 4);
-                if (rw == 0x00000000u &&
-                    *(const volatile uint8_t *)(addr + 55) == 0x00) {
-                    s_queue[i].confirmed = 1;
+                /* 状态不确定 → 保留补传资格。先搬到新槽恢复可写状态，
+                   再在新槽上写确认字（这一步失败就继续待发，下次 ACK 再来）。 */
+                if (FS_RelocateSlot(i) == 0) {
+                    addr = s_act_data_addr + FLASH_STORE_SECTOR_HDR
+                         + s_queue[i].slot * FLASH_STORE_REC_SIZE;
+                    cs = FS_ConfirmStateAt(addr);
+                } else {
+                    cs = FS_CONFIRM_BAD;       /* 搬不动：继续待发 */
                 }
-            } else {
-                /* 编程失败：重新读一次确认字。
-                   - 仍是全 FF（根本没写进去）→ 保留待确认，下次 ACK 重试；
-                   - 变成坏值（掉电把 word 写了一部分）→ 按已确认处理。 */
-                memcpy(&cw, (const void *)(addr + 60), 4);
-                if (FS_ConfirmState(cw) == FS_CONFIRM_BAD) s_queue[i].confirmed = 1;
+            }
+
+            if (cs == FS_CONFIRM_PRISTINE) {
+                if (FS_ProgWord(addr + 60, 0x00000000u) == 0) {
+                    uint32_t rw;
+                    memcpy(&rw, (const void *)(addr + 60), 4);
+                    if (rw == 0x00000000u &&
+                        *(const volatile uint8_t *)(addr + 55) == 0x00) {
+                        s_queue[i].confirmed = 1;
+                    }
+                }
+                /* 编程失败（没写进去 / 写坏）：一律保留待确认。
+                   写坏的 word 下次会走上面的迁移分支，不会死循环。 */
             }
             break;
         }
