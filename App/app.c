@@ -91,3 +91,17 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         Bus_OnRxByte(huart);
     }
 }
+
+/* UART 错误恢复：Flash 擦写期间若 ACK 到达触发 ORE/FE/NE/PE，
+   若不处理，USART1 会永久停止接收 ACK（记录将无限重发）。
+   读 SR 再读 DR 清除全部错误标志，然后重新武装单字节中断接收。 */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart == &huart1) {
+        volatile uint32_t tmp = huart->Instance->SR;
+        tmp = huart->Instance->DR;
+        (void)tmp;
+        uint8_t *buf = Dtu_RxByteBuf();
+        HAL_UART_Receive_IT(&huart1, buf, 1);
+    }
+}

@@ -72,6 +72,7 @@ typedef enum {
     FS_ERR_CRC    = 2,
     FS_ERR_BUSY   = 3,
     FS_ERR_EMPTY  = 4,
+    FS_ERR_IO     = 5,   /* Flash 写入/回读校验失败 */
 } FS_Err_t;
 
 /* 一条待上传记录（内存态，从Flash读出后使用） */

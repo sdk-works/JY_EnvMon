@@ -3,14 +3,22 @@
   * @file    dtu.c
   * @brief   DTU(DR154) 可靠上报云平台实现 —— 契约 v1.2
   *
- * 通过 USART1(RS232, 9600 8N1) 发单行JSON到DR154，DR154以MQTT透传到云端。
- * 云端落库成功后回 agri/device/{id}/ack (upload_ack)，本模块按 '{}' 对象边界解析
- * （兼容 DTU 下行把 '\n' 剥掉的情况，不再依赖尾随换行切帧），匹配 msg_id 后
- * 调用 FS_MarkConfirmed 出队。
+  * 通过 USART1(RS232, 9600 8N1) 发单行JSON到DR154，DR154以MQTT透传到云端。
+  * 云端落库成功后回 agri/device/{id}/ack (upload_ack)，本模块按 '{}' 对象边界解析
+  * （兼容 DTU 下行把 '\n' 剥掉的情况，不再依赖尾随换行切帧），校验
+  * type=upload_ack / status=stored / msg_id 全等后调用 FS_MarkConfirmed 出队。
   *
   * 上报状态机（契约 §8）：
   *   每 DTU_NEW_RECORD_MS 持久化一条新记录(flash_store)；发送槽≥DTU_SEND_SLOT_MS；
   *   优先补历史(每3条插1条最新)；未确认退避重发(上限300s)；链路疑似故障走周期探测。
+  *
+  * 可靠性加固（2026-10-21）：
+  *   - ACK 解析不再整缓冲 strstr，改为"临界区拷出完整对象→NUL 缓冲→全等比较"；
+  *   - 与 USART1 中断共享的接收缓冲在取/移数据时关中断；
+  *   - 发送前检查 UART 返回值，串口未发出不算"等待云端 ACK"；
+  *   - 退避重发后转 SENDING（原实现停在 BACKOFF 每 tick 重发，退避失效）；
+  *   - 指数退避位移做钳位，消除 1u<<(n-1) 溢出 UB；
+  *   - boot_id 落盘失败进入"身份存储故障"，禁止生成新记录，避免撞云端历史。
   ******************************************************************************
   */
 #include "dtu.h"
@@ -49,6 +57,8 @@ static uint32_t     s_seq          = 0;      /* 本次启动内 seq 递增（契
 
 /* 设备身份 */
 static uint32_t     s_boot_id = 0;
+/* 身份层状态：true=本次 boot_id 已成功落盘并校验，允许生成新记录 */
+static bool         s_identity_ok = false;
 
 /* ====== 内部函数 ====== */
 
@@ -131,107 +141,132 @@ static uint16_t Dtu_BuildTelemetry(const FS_Record_t *rec, char *buf, uint16_t m
     return (uint16_t)pos;
 }
 
-/* 通过 USART1 发送一帧（阻塞发完） */
-static void Dtu_Send(const uint8_t *data, uint16_t len)
+/* 通过 USART1 发送一帧（阻塞发完）。返回 0 已发出，-1 未发出 */
+static int Dtu_Send(const uint8_t *data, uint16_t len)
 {
     /* 9600bps 下 512B 需 ~533ms，200ms 会中途超时截断报文；放宽到 1000ms 覆盖整帧 */
-    HAL_UART_Transmit(&huart1, (uint8_t*)data, len, 1000);
+    return (HAL_UART_Transmit(&huart1, (uint8_t*)data, len, 1000) == HAL_OK) ? 0 : -1;
 }
 
-/* 发送一条记录；返回是否成功（仅指串口发出，不代表云端入库） */
-static void Dtu_SendRecord(const FS_Record_t *rec)
+/* 发送一条记录；返回 1=已从串口发出（不代表云端入库），0=串口未发出。
+   tx 改为 static，避免 512B 栈占用叠加 Dtu_BuildTelemetry 的浮点/snprintf 峰值。 */
+static int Dtu_SendRecord(const FS_Record_t *rec)
 {
-    char tx[DTU_TX_BUF_SIZE];
-    uint16_t len = Dtu_BuildTelemetry(rec, tx, sizeof(tx));
-    Dtu_Send((const uint8_t*)tx, len);
+    static char s_tx_buf[DTU_TX_BUF_SIZE];
+    uint16_t len = Dtu_BuildTelemetry(rec, s_tx_buf, sizeof(s_tx_buf));
+    if (Dtu_Send((const uint8_t*)s_tx_buf, len) != 0) {
+        return 0;   /* 串口未发出：不计为云端失败，调用方稍后重试 */
+    }
     s_pending_boot = rec->boot_id;
     s_pending_seq  = rec->seq;
     s_last_send_ms = HAL_GetTick();
-    s_state = DTU_SENDING;
+    return 1;
 }
 
-/* 解析 ACK JSON，检查是否匹配当前 pending；匹配则确认并出队 */
-static int Dtu_ParseAck(const uint8_t *line, uint16_t len)
+/* 在扁平 JSON 对象中取字符串字段值（允许 key 与 value 间有空白）。
+   成功返回 true 并写入 out（NUL 结尾）。 */
+static bool Dtu_GetStr(const char *obj, const char *key, char *out, size_t cap)
 {
-    /* 简单定位 msg_id 和 status */
-    char *p = strstr((char*)line, "\"msg_id\":\"");
-    char *s = strstr((char*)line, "\"status\":\"stored\"");
-    if (!p || !s) return 0;
-
-    p += strlen("\"msg_id\":\"");
-    /* 解析 boot/seq：格式 device/boot/seq */
-    char *end = strchr(p, '"');
-    if (!end) return 0;
-    char msgid[64];
-    uint16_t idlen = (uint16_t)(end - p);
-    if (idlen == 0 || idlen >= sizeof(msgid)) return 0;
-    memcpy(msgid, p, idlen); msgid[idlen] = 0;
-
-    /* 从 msg_id 尾部解析 seq 和 boot（格式 dev/boot/seq） */
-    long boot = 0, seq = 0;
-    char *last_slash = strrchr(msgid, '/');
-    if (last_slash) {
-        seq = atol(last_slash + 1);
-        *last_slash = 0;
-        char *first_slash = strrchr(msgid, '/');
-        if (first_slash) boot = atol(first_slash + 1);
-    }
-    /* 匹配当前 pending */
-    if (boot == (long)s_pending_boot && seq == (long)s_pending_seq) {
-        FS_MarkConfirmed(s_pending_boot, s_pending_seq);
-        s_state = DTU_IDLE;
-        s_retry_cnt = 0;
-        return 1;
-    }
-    return 0;
+    const char *p = strstr(obj, key);
+    if (!p) return false;
+    p += strlen(key);
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != ':') return false;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != '"') return false;
+    p++;
+    const char *e = strchr(p, '"');
+    if (!e) return false;
+    size_t n = (size_t)(e - p);
+    if (n == 0 || n >= cap) return false;
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return true;
 }
 
-/* 处理接收缓冲：不再依赖尾随 '\n' 切帧。
-   DTU 下行透传 ACK 时可能剥掉 '\n'，原按 '\n' 切帧会永远收不到 ACK，
-   导致同一条记录无限重发（用户观察到的"重复消息"）。
-   改为：只要缓冲中出现一个完整 JSON 对象（配对的 '{'...'}'），即解析为一帧 ACK。 */
+/* 解析 ACK 对象：校验 type=upload_ack、status=stored、msg_id 与期望完全相等
+   （msg_id 形如 "JY001/<boot>/<seq>"，天然覆盖 device_id 与编号格式）。
+   obj 必须是 NUL 结尾的完整对象。匹配则确认出队。 */
+static int Dtu_ParseAck(const char *obj)
+{
+    char type[24], status[16], msgid[64];
+
+    if (!Dtu_GetStr(obj, "\"type\"", type, sizeof(type)) ||
+        strcmp(type, "upload_ack") != 0) return 0;
+    if (!Dtu_GetStr(obj, "\"status\"", status, sizeof(status)) ||
+        strcmp(status, "stored") != 0) return 0;
+    if (!Dtu_GetStr(obj, "\"msg_id\"", msgid, sizeof(msgid))) return 0;
+
+    char expect[64];
+    int n = snprintf(expect, sizeof(expect), "%s/%lu/%lu",
+                     DTU_DEVICE_ID,
+                     (unsigned long)s_pending_boot,
+                     (unsigned long)s_pending_seq);
+    if (n <= 0 || (size_t)n >= sizeof(expect)) return 0;
+
+    if (strcmp(msgid, expect) != 0) return 0;
+
+    FS_MarkConfirmed(s_pending_boot, s_pending_seq);
+    s_state = DTU_IDLE;
+    s_retry_cnt = 0;
+    return 1;
+}
+
+/* 处理接收缓冲：按 '{}' 对象边界切帧（兼容 DTU 下行剥掉 '\n'）。
+   - 与 USART1 中断里的 Dtu_OnRxByte 共享缓冲，取/移数据时关中断；
+   - 只把"完整对象"拷出，在临界区外解析（避免 Flash 写入期间长时间关中断）。 */
 static void Dtu_ProcessRx(void)
 {
-    uint16_t i = 0;
-    while (i < s_rx_len) {
-        /* 找对象闭合符 '}' */
-        if (s_rx_buf[i] != '}') { i++; continue; }
-        /* 从该 '}' 向前找最近的匹配 '{'（ACK 为扁平 JSON，无嵌套） */
-        int open = -1;
-        for (int k = (int)i - 1; k >= 0; k--) {
-            if (s_rx_buf[k] == '{') { open = k; break; }
+    static char s_obj[DTU_RX_BUF_SIZE + 1];
+
+    for (;;) {
+        uint16_t objlen = 0;
+
+        /* --- 临界区：仅操作共享缓冲，不做 Flash 操作 --- */
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
+
+        int startp = -1, endp = -1;
+        for (uint16_t i = 0; i < s_rx_len; i++) {
+            if (s_rx_buf[i] == '{') {
+                startp = (int)i;
+            } else if (s_rx_buf[i] == '}' && startp >= 0) {
+                endp = (int)i;
+                break;
+            }
         }
-        if (open < 0) { i++; continue; }   /* 无配对 '{'，跳过该 '}' */
-        uint16_t objlen = (uint16_t)(i - open + 1);
-        Dtu_ParseAck(&s_rx_buf[open], objlen);
-        /* 消费已解析段 [open, i]，把后续未处理字节前移 */
-        uint16_t rest = s_rx_len - i - 1;
-        if (rest > 0) memmove(&s_rx_buf[open], &s_rx_buf[i + 1], rest);
-        s_rx_len = rest;
-        i = open;   /* 从合并点继续扫描后续帧（支持连续多帧无分隔） */
-    }
-    /* 去掉首部非对象字节（防止无关垃圾在缓冲头部堆积） */
-    if (s_rx_len > 0 && s_rx_buf[0] != '{') {
-        uint16_t first = 0;
-        for (uint16_t k = 0; k < s_rx_len; k++) {
-            if (s_rx_buf[k] == '{') { first = k; break; }
+        if (startp >= 0 && endp > startp) {
+            objlen = (uint16_t)(endp - startp + 1);
+            if (objlen > DTU_RX_BUF_SIZE) objlen = DTU_RX_BUF_SIZE;
+            memcpy(s_obj, &s_rx_buf[startp], objlen);
+            uint16_t rest = (uint16_t)(s_rx_len - (uint16_t)(endp + 1));
+            if (rest) memmove(&s_rx_buf[0], &s_rx_buf[endp + 1], rest);
+            s_rx_len = rest;
+        } else if (startp >= 0) {
+            /* 有 '{' 但未闭合：丢弃其前的垃圾，保留未完成对象 */
+            if (startp > 0) {
+                uint16_t rest = (uint16_t)(s_rx_len - (uint16_t)startp);
+                memmove(&s_rx_buf[0], &s_rx_buf[startp], rest);
+                s_rx_len = rest;
+            }
+        } else {
+            s_rx_len = 0;   /* 无 '{'：全是垃圾，清空 */
         }
-        if (first > 0) {
-            memmove(s_rx_buf, &s_rx_buf[first], s_rx_len - first);
-            s_rx_len -= first;
-        }
+
+        __set_PRIMASK(primask);
+        /* --- 临界区结束 --- */
+
+        if (objlen == 0) break;
+        s_obj[objlen] = '\0';
+        Dtu_ParseAck(s_obj);   /* Flash 操作在此，中断已恢复 */
     }
-    /* 若残余中已无 '{'，视为垃圾直接清空（避免缓冲头部无关字节长期驻留） */
-    int has_open = 0;
-    for (uint16_t k = 0; k < s_rx_len; k++) {
-        if (s_rx_buf[k] == '{') { has_open = 1; break; }
-    }
-    if (!has_open) s_rx_len = 0;
 }
 
 /* 判断是否到时间生成一条新记录并持久化（契约 §8.1：每 DTU_NEW_RECORD_MS） */
 static void Dtu_MaybeNewRecord(void)
 {
+    if (!s_identity_ok) return;   /* 身份未落盘校验：禁止生成新记录，避免撞云端历史 */
     uint32_t now = HAL_GetTick();
     if (now - s_last_record_ms >= DTU_NEW_RECORD_MS) {
         s_last_record_ms = now;
@@ -261,7 +296,7 @@ static void Dtu_MaybeNewRecord(void)
         if (g_env.soil_valid)    valid |= 0xE0;   /* bit5-7: soil_temp,soil_moist,soil_ec */
         rec.valid = valid;
 
-        /* 写入失败（队列满且回收失败）时不递增 seq，避免编号空洞 */
+        /* 写入失败（队列满/Flash IO 失败）时不递增 seq，避免编号空洞 */
         if (FS_Append(&rec) != FS_OK) {
             s_seq--;
         }
@@ -276,24 +311,28 @@ static void Dtu_RunStateMachine(void)
     switch (s_state) {
     case DTU_IDLE:
         /* 有待发记录则开一个发送槽（读队首发送，不移除索引，等 ACK 才出队） */
-        if (FS_PendingCount() > 0) {
-            if (now - s_last_send_ms >= DTU_SEND_SLOT_MS) {
-                FS_Record_t rec;
-                /* 契约 §8.2：默认补历史（队首，保留原 msg_id/sampled_at）；
-                   每补传 DTU_HIST_PER_NEW 条历史，插发一条最新，避免实时数据被饿死。
-                   插队只是调度优先级，不改变 60s 采样节律（不额外生成样本）。 */
-                bool send_latest = false;
-                if (s_hist_sent >= DTU_HIST_PER_NEW) {
-                    if (FS_PeekLatest(&rec)) {
-                        send_latest = true;
-                        s_hist_sent = 0;
-                    }
+        if (FS_PendingCount() > 0 && (now - s_last_send_ms >= DTU_SEND_SLOT_MS)) {
+            FS_Record_t rec;
+            /* 契约 §8.2：默认补历史（队首，保留原 msg_id/sampled_at）；
+               每补传 DTU_HIST_PER_NEW 条历史，插发一条最新，避免实时数据被饿死。
+               插队只是调度优先级，不改变采样节律（不额外生成样本）。 */
+            bool send_latest = false;
+            if (s_hist_sent >= DTU_HIST_PER_NEW) {
+                if (FS_PeekLatest(&rec)) {
+                    send_latest = true;
+                    s_hist_sent = 0;
                 }
-                if (!send_latest) {
-                    if (!FS_Peek(&rec, true)) break;
-                    s_hist_sent++;
-                }
-                Dtu_SendRecord(&rec);
+            }
+            if (!send_latest) {
+                if (!FS_Peek(&rec, true)) break;
+                s_hist_sent++;
+            }
+            if (Dtu_SendRecord(&rec)) {
+                s_state = DTU_SENDING;
+            } else {
+                /* 串口未发出：不计云端失败，稍后重试 */
+                s_state = DTU_BACKOFF;
+                s_next_action_ms = now + DTU_SEND_SLOT_MS;
             }
         }
         break;
@@ -302,44 +341,43 @@ static void Dtu_RunStateMachine(void)
         /* 等待ACK：超时(如8s)进入退避 */
         if (now - s_last_send_ms >= 8000) {
             s_retry_cnt++;
-            /* 指数退避：5s~300s，超过5次转周期探测 */
-            uint32_t backoff = (1u << (s_retry_cnt - 1)) * DTU_SEND_SLOT_MS;
-            if (backoff > 300000) backoff = 300000;
+            /* 指数退避：2s/4s/8s/16s/32s...；位移钳位到 6，消除溢出 UB，上限 300s */
+            uint32_t shift = (s_retry_cnt > 7) ? 6 : (s_retry_cnt - 1);
+            uint32_t backoff = (1u << shift) * (uint32_t)DTU_SEND_SLOT_MS;
+            if (backoff > 300000u) backoff = 300000u;
             s_next_action_ms = now + backoff;
             s_state = DTU_BACKOFF;
         }
         break;
 
     case DTU_BACKOFF:
-        if (now >= s_next_action_ms) {
-            /* 重发当前 pending（同一 msg_id，保留编号；队首即 pending，未ACK未出队） */
-            FS_Record_t rec;
-            if (FS_Peek(&rec, true)) {
-                if (rec.boot_id == s_pending_boot && rec.seq == s_pending_seq) {
-                    Dtu_SendRecord(&rec);   /* 保持原 msg_id */
-                } else if (s_retry_cnt >= 5) {
-                    s_state = DTU_PROBE;
-                    s_next_action_ms = now + 30000;
+        if ((int32_t)(now - s_next_action_ms) >= 0) {
+            if (s_retry_cnt >= 5) {
+                /* 连续失败转周期探测 */
+                s_state = DTU_PROBE;
+                s_next_action_ms = now;   /* 立即探测一次 */
+            } else {
+                /* 重发当前 pending（同一 msg_id，保留编号；队首即 pending） */
+                FS_Record_t rec;
+                if (FS_Peek(&rec, true)) {
+                    if (Dtu_SendRecord(&rec)) s_state = DTU_SENDING;
+                    else s_next_action_ms = now + DTU_SEND_SLOT_MS;
                 } else {
                     s_state = DTU_IDLE;
                 }
-            } else if (s_retry_cnt >= 5) {
-                s_state = DTU_PROBE;
-                s_next_action_ms = now + 30000;
-            } else {
-                s_state = DTU_IDLE;
             }
         }
         break;
 
     case DTU_PROBE:
         /* 周期探测：每30s发一条最新试探，收到ACK即恢复 */
-        if (now >= s_next_action_ms) {
+        if ((int32_t)(now - s_next_action_ms) >= 0) {
             FS_Record_t rec;
-            if (FS_Peek(&rec, true)) {
-                Dtu_SendRecord(&rec);   /* 发完不移索引，等 ACK */
+            bool pending = FS_Peek(&rec, true);
+            if (pending) {
+                (void)Dtu_SendRecord(&rec);   /* 结果忽略，保持探测节奏 */
             } else {
-                s_state = DTU_IDLE;   /* 无待发，恢复空闲 */
+                s_state = DTU_IDLE;           /* 无待发，恢复空闲 */
             }
             s_next_action_ms = now + 30000;
         }
@@ -352,13 +390,24 @@ static void Dtu_RunStateMachine(void)
 void Dtu_Init(void)
 {
     FS_Init();
-    s_boot_id = FS_NextBootId();   /* 生成本次启动编号；失败则用FS_GetBootId兜底 */
-    if (s_boot_id == 0) s_boot_id = FS_GetBootId();
+
+    /* 身份层：只有 FS_NextBootId 成功落盘并校验通过才允许生成新记录。
+       失败则进入"身份存储故障"：禁止新建/上传新数据，但保留补传已持久化旧记录。 */
+    uint32_t nb = FS_NextBootId();
+    if (nb != 0) {
+        s_boot_id = nb;
+        s_identity_ok = true;
+    } else {
+        s_boot_id = FS_GetBootId();
+        s_identity_ok = false;
+    }
 
     s_state = DTU_IDLE;
     s_rx_len = 0;
     s_last_send_ms = 0;
-    /* 以当前时刻为基准，第一条记录在 60s 后生成（契约 §8.1）。
+    s_pending_boot = 0;
+    s_pending_seq  = 0;
+    /* 以当前时刻为基准，第一条记录在 DTU_NEW_RECORD_MS 后生成（契约 §8.1）。
        若置 0，HAL_GetTick() 起点接近 0 会导致上电瞬间立即写一条。 */
     s_last_record_ms = HAL_GetTick();
     s_hist_sent = 0;
@@ -390,3 +439,4 @@ void Dtu_Tick(void)
 uint32_t Dtu_PendingCount(void) { return FS_PendingCount(); }
 uint32_t Dtu_DroppedCount(void) { return FS_DroppedCount(); }
 uint32_t Dtu_LastBootId(void)   { return s_boot_id; }
+uint8_t  Dtu_IdentityOk(void)   { return s_identity_ok ? 1 : 0; }

@@ -10,6 +10,12 @@
   *     两个扇区都失效才从1开始。
   *   - 状态位只从1→0；CRC 只覆盖不变数据；提交标识区分完整/残缺记录。
   *
+  * 可靠性加固（2026-10-21）：
+  *   - 每个 Flash 写/擦操作检查 HAL 返回值；元数据回读 boot+gen+CRC 三项；
+  *   - 记录写入后回读解包校验 CRC/提交位/boot/seq，通过后才入队；
+  *   - 确认位写入后回读 [54]==0 && [55]==0 才出队，失败保留待确认；
+  *   - 迁移扇区头写入后回读校验（magic/代次/committed/used）。
+  *
   * 简化说明：本实现把"待发记录索引"维护在RAM（每条64B，最多约2000条=128KB RAM 的
   * 子集，F407 有 192KB RAM 可用），Flash 负责掉电持久化恢复。
   ******************************************************************************
@@ -123,43 +129,49 @@ static int FS_UnpackRecord(const uint8_t in[FLASH_STORE_REC_SIZE], FS_Record_t *
     return 0;
 }
 
-/* 擦除一个扇区（整扇区） */
-static void FS_EraseSector(uint32_t sector_num)
+/* 擦除一个扇区（整扇区）。返回 0 成功，-1 失败 */
+static int FS_EraseSector(uint32_t sector_num)
 {
     FLASH_EraseInitTypeDef er;
-    uint32_t err = 0;
+    uint32_t err = 0xFFFFFFFFu;
     er.TypeErase = FLASH_TYPEERASE_SECTORS;
     er.Sector = sector_num;
     er.NbSectors = 1;
     er.VoltageRange = FLASH_VOLTAGE_RANGE_3;
     HAL_FLASH_Unlock();
-    HAL_FLASHEx_Erase(&er, &err);
+    HAL_StatusTypeDef st = HAL_FLASHEx_Erase(&er, &err);
     HAL_FLASH_Lock();
+    return (st == HAL_OK) ? 0 : -1;
 }
 
-/* 写 32-bit word 到 flash */
-static void FS_ProgWord(uint32_t addr, uint32_t val)
+/* 写 32-bit word 到 flash。返回 0 成功，-1 失败 */
+static int FS_ProgWord(uint32_t addr, uint32_t val)
 {
     HAL_FLASH_Unlock();
-    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr, val);
+    HAL_StatusTypeDef st = HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr, val);
     HAL_FLASH_Lock();
+    return (st == HAL_OK) ? 0 : -1;
 }
 
-/* 写多条记录到数据扇区（addr 起，每条64B）。写数据+CRC，最后写提交标识。 */
-static void FS_WriteRecordToFlash(uint32_t addr, const FS_Record_t *r)
+/* 写一条记录到数据扇区（addr 起，64B）。写数据+CRC，最后写提交标识。
+   返回 0 成功，-1 任一 word 写入失败（调用方需回读校验）。 */
+static int FS_WriteRecordToFlash(uint32_t addr, const FS_Record_t *r)
 {
     uint8_t buf[FLASH_STORE_REC_SIZE];
     FS_PackRecord(r, buf);
+    int rc = 0;
     HAL_FLASH_Unlock();
     for (int i = 0; i < FLASH_STORE_REC_SIZE / 4; i++) {
         uint32_t val;
         memcpy(&val, &buf[i*4], 4);
-        HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + i*4, val);
+        if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + i*4, val) != HAL_OK) rc = -1;
     }
     HAL_FLASH_Lock();
+    if (rc != 0) return -1;
     /* 提交标识 [55]→0（word@addr+52 = 字节52,53,54,55，[55]是最高字节）
        小端：0x00FFFFFF = [52..54]保持FF, [55]=00 */
-    FS_ProgWord(addr + 52, 0x00FFFFFF);
+    if (FS_ProgWord(addr + 52, 0x00FFFFFF) != 0) return -1;
+    return 0;
 }
 
 /* 读数据扇区头 */
@@ -182,6 +194,16 @@ static uint32_t FS_ScanUsed(uint32_t base)
         if (blank) return i;
     }
     return FLASH_STORE_CAP_PER_SECTOR;
+}
+
+/* 判断一个记录槽是否仍为擦除态（全 0xFF）。
+   写入失败后用它区分"完全没写进去（空槽，可重试）"与"部分写坏（非空，需跳过）"。 */
+static int FS_SlotBlank(uint32_t addr)
+{
+    const uint8_t *p = (const uint8_t *)addr;
+    for (uint32_t k = 0; k < FLASH_STORE_REC_SIZE; k++)
+        if (p[k] != 0xFF) return 0;
+    return 1;
 }
 
 /* 从指定数据扇区恢复 RAM 队列索引（只载入未确认记录） */
@@ -210,17 +232,24 @@ static int32_t FS_CopyPendingTo(uint32_t target_base, uint32_t new_gen)
     /* 先擦目标扇区 */
     uint32_t target_sector = (target_base == FS_SECTOR5_ADDR) ? FLASH_STORE_SECTOR_DATA_A
                                                               : FLASH_STORE_SECTOR_DATA_B;
-    FS_EraseSector(target_sector);
+    if (FS_EraseSector(target_sector) != 0) return -1;
+
     /* 写新头（代次+1，committed 暂为未完成） */
     FS_DataHdr_t hdr;
     hdr.magic = FS_MAGIC;
     hdr.generation = new_gen;
     hdr.committed = 0xFFFFFFFF;   /* 未完成 */
     hdr.used = s_q_count;
-    FS_ProgWord(target_base + 0,  hdr.magic);
-    FS_ProgWord(target_base + 4,  hdr.generation);
-    FS_ProgWord(target_base + 8,  hdr.committed);
-    FS_ProgWord(target_base + 12, hdr.used);
+    if (FS_ProgWord(target_base + 0,  hdr.magic) != 0) return -1;
+    if (FS_ProgWord(target_base + 4,  hdr.generation) != 0) return -1;
+    if (FS_ProgWord(target_base + 8,  hdr.committed) != 0) return -1;
+    if (FS_ProgWord(target_base + 12, hdr.used) != 0) return -1;
+
+    /* 扇区头回读校验（原实现只校验记录、未校验头） */
+    if (*(volatile uint32_t *)(target_base + 0)  != hdr.magic) return -1;
+    if (*(volatile uint32_t *)(target_base + 4)  != hdr.generation) return -1;
+    if (*(volatile uint32_t *)(target_base + 8)  != 0xFFFFFFFFu) return -1;
+    if (*(volatile uint32_t *)(target_base + 12) != hdr.used) return -1;
 
     /* 逐条复制：任一条 CRC/提交标识校验失败即整体失败（不留下残缺扇区） */
     uint32_t copied = 0;
@@ -232,10 +261,11 @@ static int32_t FS_CopyPendingTo(uint32_t target_base, uint32_t new_gen)
             return -1;                      /* 源记录损坏，整体放弃迁移 */
         }
         uint32_t dst_addr = target_base + FLASH_STORE_SECTOR_HDR + i * FLASH_STORE_REC_SIZE;
-        FS_WriteRecordToFlash(dst_addr, &rec);
-        /* 回读校验：目标记录必须可解包，否则视为写入失败 */
+        if (FS_WriteRecordToFlash(dst_addr, &rec) != 0) return -1;
+        /* 回读校验：目标记录必须可解包且编号一致，否则视为写入失败 */
         FS_Record_t chk;
-        if (FS_UnpackRecord((const uint8_t*)dst_addr, &chk) != 0) {
+        if (FS_UnpackRecord((const uint8_t*)dst_addr, &chk) != 0 ||
+            chk.boot_id != rec.boot_id || chk.seq != rec.seq) {
             return -1;
         }
         copied++;
@@ -244,11 +274,26 @@ static int32_t FS_CopyPendingTo(uint32_t target_base, uint32_t new_gen)
     /* 总数核对：契约要求"逐条 CRC + 总数"，缺一不可 */
     if (copied != s_q_count) return -1;
 
-    /* 提交完成标识（最后写） */
-    FS_ProgWord(target_base + 8, 0);
+    /* 提交完成标识（最后写）+ 回读 */
+    if (FS_ProgWord(target_base + 8, 0) != 0) return -1;
     if (*(volatile uint32_t *)(target_base + 8) != 0) return -1;
 
     return (int32_t)copied;
+}
+
+/* 读取指定元数据扇区中 CRC 有效且最大的 boot_id */
+static uint32_t FS_MaxBootInSector(uint32_t base, uint32_t cap)
+{
+    uint32_t boot = 0;
+    for (uint32_t k = 0; k < cap; k++) {
+        uint32_t addr = base + k * FS_META_REC_SIZE;
+        uint32_t b = *(volatile uint32_t*)addr;
+        if (b == 0xFFFFFFFF) break;   /* 空槽，之后也是空的 */
+        uint16_t crc = Modbus_CRC16((const uint8_t*)addr, 8);
+        uint16_t stored = *(volatile uint16_t*)(addr + 8);
+        if (crc == stored && b > boot) boot = b;
+    }
+    return boot;
 }
 
 /* 读取持久 boot_id：两元数据扇区所有槽中，取 CRC 有效且 boot_id 最大的。
@@ -274,7 +319,8 @@ static uint32_t FS_LoadBootId(void)
     return boot;
 }
 
-/* 追加写一个 boot_id 到指定元数据扇区；返回写入槽序号，满/失败返回-1 */
+/* 追加写一个 boot_id 到指定元数据扇区；返回写入槽序号，满/失败返回-1。
+   写入后回读 boot_id/generation/CRC 三项，全部一致才算成功。 */
 static int FS_MetaAppend(uint32_t base, uint32_t cap, uint32_t boot, uint32_t gen)
 {
     /* 找第一个空槽 */
@@ -284,13 +330,20 @@ static int FS_MetaAppend(uint32_t base, uint32_t cap, uint32_t boot, uint32_t ge
     }
     if (slot == 0xFFFFFFFF) return -1;   /* 满 */
     uint32_t addr = base + slot * FS_META_REC_SIZE;
-    FS_ProgWord(addr + 0, boot);
-    FS_ProgWord(addr + 4, gen);
+
+    if (FS_ProgWord(addr + 0, boot) != 0) return -1;
+    if (FS_ProgWord(addr + 4, gen)  != 0) return -1;
+    /* CRC 基于已写入的实际字节计算 */
     uint16_t crc = Modbus_CRC16((const uint8_t*)addr, 8);
-    FS_ProgWord(addr + 8, (uint32_t)(crc & 0xFFFF));
-    /* 校验 */
-    if (*(volatile uint32_t*)addr == boot) return (int)slot;
-    return -1;
+    if (FS_ProgWord(addr + 8, (uint32_t)(crc & 0xFFFF)) != 0) return -1;
+
+    /* 回读三项：boot_id / generation / CRC */
+    if (*(volatile uint32_t*)addr != boot) return -1;
+    if (*(volatile uint32_t*)(addr + 4) != gen) return -1;
+    if (*(volatile uint16_t*)(addr + 8) != crc) return -1;
+    if (Modbus_CRC16((const uint8_t*)addr, 8) != *(volatile uint16_t*)(addr + 8)) return -1;
+
+    return (int)slot;
 }
 
 /* ====== 公开接口 ====== */
@@ -302,7 +355,7 @@ void FS_Init(void)
 
     /* 恢复 boot_id */
     s_boot_id = FS_LoadBootId();
-    if (s_boot_id == 0) s_boot_id = 1;   /* 首次上电 */
+    if (s_boot_id == 0) s_boot_id = 1;   /* 首次上电（注意：NextBootId 会再+1） */
 
     /* 选择数据活动扇区：两个扇区头中代次最新且已提交的 */
     FS_DataHdr_t h5, h6;
@@ -328,12 +381,25 @@ void FS_Init(void)
         /* 都无效：擦 S5，从代次1开始 */
         s_act_data_addr = FS_SECTOR5_ADDR;
         s_act_data_gen  = 1;
-        FS_EraseSector(FLASH_STORE_SECTOR_DATA_A);
+        if (FS_EraseSector(FLASH_STORE_SECTOR_DATA_A) != 0) {
+            /* 擦除失败：不假装已初始化，置空队列（上层将无记录可发） */
+            s_generation = s_act_data_gen;
+            s_used = 0;
+            s_q_count = 0;
+            return;
+        }
         FS_DataHdr_t h; h.magic=FS_MAGIC; h.generation=1; h.committed=0; h.used=0;
-        FS_ProgWord(s_act_data_addr+0, h.magic);
-        FS_ProgWord(s_act_data_addr+4, h.generation);
-        FS_ProgWord(s_act_data_addr+8, h.committed);
-        FS_ProgWord(s_act_data_addr+12, h.used);
+        if (FS_ProgWord(s_act_data_addr+0, h.magic) != 0 ||
+            FS_ProgWord(s_act_data_addr+4, h.generation) != 0 ||
+            FS_ProgWord(s_act_data_addr+8, h.committed) != 0 ||
+            FS_ProgWord(s_act_data_addr+12, h.used) != 0 ||
+            *(volatile uint32_t*)(s_act_data_addr+0) != FS_MAGIC ||
+            *(volatile uint32_t*)(s_act_data_addr+8) != 0) {
+            s_generation = s_act_data_gen;
+            s_used = 0;
+            s_q_count = 0;
+            return;
+        }
     }
     s_generation = s_act_data_gen;
 
@@ -355,13 +421,28 @@ uint32_t FS_NextBootId(void)
     int r = FS_MetaAppend(FS_SECTOR4_ADDR, FS_META_CAP_A, new_boot, gen);
     if (r >= 0) { s_boot_id = new_boot; return s_boot_id; }
 
-    /* Sector4 满：尝试 Sector7 */
+    /* Sector4 满/失败：尝试 Sector7 */
     r = FS_MetaAppend(FS_SECTOR7_ADDR, FS_META_CAP_B, new_boot, gen);
     if (r >= 0) { s_boot_id = new_boot; return s_boot_id; }
 
-    /* 双扇区都满：擦 Sector4，重新从起始写（Sector7 保留旧值兜底，掉电安全） */
-    FS_EraseSector(FLASH_STORE_SECTOR_META_A);
-    r = FS_MetaAppend(FS_SECTOR4_ADDR, FS_META_CAP_A, new_boot, gen);
+    /* 双扇区都满/失败：只能擦"较旧"的那个扇区，把新编号写进去。
+       前提：保留扇区必须持有当前最大有效编号（s_boot_id），否则擦除后掉电
+       会回退到更旧编号 → 撞云端历史。不满足则返回 0，进入身份存储故障。 */
+    uint32_t max_a = FS_MaxBootInSector(FS_SECTOR4_ADDR, FS_META_CAP_A);
+    uint32_t max_b = FS_MaxBootInSector(FS_SECTOR7_ADDR, FS_META_CAP_B);
+
+    uint32_t erase_addr, erase_cap, keep_max, erase_sector;
+    if (max_b >= max_a) {
+        erase_addr = FS_SECTOR4_ADDR; erase_cap = FS_META_CAP_A;
+        erase_sector = FLASH_STORE_SECTOR_META_A; keep_max = max_b;
+    } else {
+        erase_addr = FS_SECTOR7_ADDR; erase_cap = FS_META_CAP_B;
+        erase_sector = FLASH_STORE_SECTOR_META_B; keep_max = max_a;
+    }
+    if (keep_max != s_boot_id) return 0;   /* 保留扇区未持有最新编号，拒绝擦除 */
+
+    if (FS_EraseSector(erase_sector) != 0) return 0;
+    r = FS_MetaAppend(erase_addr, erase_cap, new_boot, gen);
     if (r >= 0) { s_boot_id = new_boot; return s_boot_id; }
     return 0;   /* 元数据不可用 */
 }
@@ -384,7 +465,20 @@ FS_Err_t FS_Append(const FS_Record_t *rec)
     }
     /* 追加到活动扇区：槽位由 s_used 决定，不再递增写回 Flash */
     uint32_t slot = s_used;
-    FS_WriteRecordToFlash(s_act_data_addr + FLASH_STORE_SECTOR_HDR + slot*FLASH_STORE_REC_SIZE, rec);
+    uint32_t addr = s_act_data_addr + FLASH_STORE_SECTOR_HDR + slot*FLASH_STORE_REC_SIZE;
+    if (FS_WriteRecordToFlash(addr, rec) != 0) {
+        /* 完全未写入（空槽）→保持 s_used，下次重试该槽，避免留下 0xFF 空洞
+           使 FS_ScanUsed 在此截断而丢后续记录；部分写坏（非空）→跳过该槽。 */
+        if (!FS_SlotBlank(addr)) s_used = slot + 1;
+        return FS_ERR_IO;
+    }
+    /* 回读整条记录：CRC/提交位/boot/seq 全部正确才入队 */
+    FS_Record_t chk;
+    if (FS_UnpackRecord((const uint8_t*)addr, &chk) != 0 ||
+        chk.boot_id != rec->boot_id || chk.seq != rec->seq) {
+        if (!FS_SlotBlank(addr)) s_used = slot + 1;
+        return FS_ERR_IO;
+    }
     s_used = slot + 1;
     s_queue[s_q_count].slot     = slot;
     s_queue[s_q_count].boot_id  = rec->boot_id;
@@ -401,8 +495,14 @@ void FS_MarkConfirmed(uint32_t boot_id, uint32_t seq)
         if (s_queue[i].boot_id == boot_id && s_queue[i].seq == seq) {
             uint32_t addr = s_act_data_addr + FLASH_STORE_SECTOR_HDR
                           + s_queue[i].slot * FLASH_STORE_REC_SIZE;
-            FS_ProgWord(addr + 52, 0xFF00FFFF); /* [54]→0（字节2），确认 */
-            s_queue[i].confirmed = 1;
+            if (FS_ProgWord(addr + 52, 0xFF00FFFF) == 0) { /* [54]→0（字节2），确认 */
+                /* 回读：确认位[54]==0 且 提交位[55]==0 才算确认成功 */
+                const volatile uint8_t *p = (const volatile uint8_t *)addr;
+                if (p[54] == 0x00 && p[55] == 0x00) {
+                    s_queue[i].confirmed = 1;
+                }
+            }
+            /* 写/回读失败：保留未确认，等下次 ACK 再试（记录不丢） */
             break;
         }
     }
@@ -466,10 +566,10 @@ FS_Err_t FS_Recycle(void)
     }
     s_used = (uint32_t)copied;
 
-    /* 擦旧扇区 */
+    /* 擦旧扇区（数据已在新扇区提交；擦除失败不影响本次切换） */
     uint32_t old_sector = (s_act_data_addr == FS_SECTOR5_ADDR) ? FLASH_STORE_SECTOR_DATA_A
                                                                : FLASH_STORE_SECTOR_DATA_B;
-    FS_EraseSector(old_sector);
+    (void)FS_EraseSector(old_sector);
     /* 切活动 */
     s_act_data_addr = target;
     s_act_data_gen  = new_gen;

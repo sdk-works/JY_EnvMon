@@ -56,4 +56,8 @@ uint32_t Dtu_PendingCount(void);
 uint32_t Dtu_DroppedCount(void);
 uint32_t Dtu_LastBootId(void);
 
+/* 身份层状态：1=本次 boot_id 已成功落盘并校验，允许生成新记录；
+   0=身份存储故障（禁止新建/上传新数据，仅补传已持久化旧记录）。 */
+uint8_t Dtu_IdentityOk(void);
+
 #endif /* __DTU_H */
