@@ -29,7 +29,9 @@
 ;   <o> Stack Size (in Bytes) <0x0-0xFFFFFFFF:8>
 ; </h>
 
-Stack_Size		EQU     0x400
+; 4KB：Dtu_BuildTelemetry 的 snprintf/浮点格式化峰值 + 8 项字段表(约224B)
+;       + 调用链嵌套，1KB 余量不足；数据/发送缓冲已改为 static，此处只留调用栈。
+Stack_Size		EQU     0x00001000
 
                 AREA    STACK, NOINIT, READWRITE, ALIGN=3
 Stack_Mem       SPACE   Stack_Size

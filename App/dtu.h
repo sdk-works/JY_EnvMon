@@ -22,11 +22,25 @@
 /* 上报身份（与云端 Device.device_id 一致） */
 #define DTU_DEVICE_ID     "JY001"
 
-/* 节律参数（契约 §8）
-   注意：以下为【测试临时值】，验证 ACK 重复问题解决后需改回：
-         DTU_SEND_SLOT_MS 5000、DTU_NEW_RECORD_MS 60000。 */
-#define DTU_SEND_SLOT_MS      2000      /* 测试：发送槽最小间隔 2s（正式 5000） */
-#define DTU_NEW_RECORD_MS     10000     /* 测试：每10s生成一条新记录（正式 60000） */
+/* ====== 节律参数（契约 §8）—— 唯一定义处，flash_store.h 不再重复定义 ======
+   用下面这一个开关切换"快速验证"与"生产节律"，不要直接改数值：
+
+     DTU_FAST_TEST_RHYTHM 打开（当前）：10s/条、2s 槽
+        → 缓存容量约 2044 条 ≈ 5h40m，便于在数小时内跑满并验证扇区迁移
+     DTU_FAST_TEST_RHYTHM 注释掉：60s/条、5s 槽
+        → 容量约 34h，正式部署用
+
+   验证内容（ACK 全等/退避/插队/断电补传）与节律无关，验证通过后
+   注释掉本宏即切回生产参数，其余代码无需改动。 */
+#define DTU_FAST_TEST_RHYTHM
+
+#ifdef DTU_FAST_TEST_RHYTHM
+#define DTU_SEND_SLOT_MS      2000      /* 发送槽最小间隔 2s（生产 5000） */
+#define DTU_NEW_RECORD_MS     10000     /* 每 10s 生成一条记录（生产 60000） */
+#else
+#define DTU_SEND_SLOT_MS      5000      /* 发送槽最小间隔 5s */
+#define DTU_NEW_RECORD_MS     60000     /* 每 60s 生成一条记录 */
+#endif
 #define DTU_HIST_PER_NEW      3         /* 每补传3条历史，插1条最新 */
 
 /* DTU 状态机 */

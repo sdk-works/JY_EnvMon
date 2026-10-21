@@ -444,6 +444,10 @@ void Dtu_Init(void)
     s_last_send_ms = 0;
     s_pending_boot = 0;
     s_pending_seq  = 0;
+    /* seq 是"本次启动内"的序号（契约 §4）：每次上电必须从 1 重新开始。
+       原实现漏了这一句，重启后会接着上次的 seq 继续加 —— 虽然 boot_id 变了
+       不至于撞号，但不符合契约，且会让"同一 boot_id 内 seq 连续"的断言失效。 */
+    s_seq = 0;
     /* 64 位运行时长起点 */
     s_uptime_ms   = 0;
     s_uptime_tick = HAL_GetTick();

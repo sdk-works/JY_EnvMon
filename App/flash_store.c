@@ -25,12 +25,35 @@
 #include <string.h>
 #include "stm32f4xx_hal.h"
 
-/* ====== 扇区地址映射（F407） ====== */
+/* ====== 扇区地址映射（F407） ======
+   生产构建：FS_ABS() 展开成编译期常量表达式，生成的机器码与原先完全一致。
+   主机测试（FS_HOST_TEST）：地址改由变量 s_flash_base 参与计算，测试才能把
+   "Flash" 映射到进程内可写区域；同时避开个别主机编译器对高位绝对地址
+   常量的代码生成缺陷（表现为写入即段错误，与固件无关）。 */
 #define FS_FLASH_BASE        0x08000000UL
-#define FS_SECTOR4_ADDR      0x08010000UL   /* 元数据A 64KB */
-#define FS_SECTOR7_ADDR      0x08060000UL   /* 元数据B 128KB */
-#define FS_SECTOR5_ADDR      0x08020000UL   /* 数据A 128KB */
-#define FS_SECTOR6_ADDR      0x08040000UL   /* 数据B 128KB */
+#define FS_OFF_META_A        0x00010000UL   /* Sector4 */
+#define FS_OFF_DATA_A        0x00020000UL   /* Sector5 */
+#define FS_OFF_DATA_B        0x00040000UL   /* Sector6 */
+#define FS_OFF_META_B        0x00060000UL   /* Sector7 */
+
+#ifdef FS_HOST_TEST
+static uint32_t s_flash_base = FS_FLASH_BASE;
+/* 仅供主机测试调整映射基址；返回原基址。生产构建不提供此符号。 */
+uint32_t FS_SetFlashBase(uint32_t base)
+{
+    uint32_t old = s_flash_base;
+    s_flash_base = base;
+    return old;
+}
+#define FS_ABS(off)          (s_flash_base + (uint32_t)(off))
+#else
+#define FS_ABS(off)          (FS_FLASH_BASE + (uint32_t)(off))
+#endif
+
+#define FS_SECTOR4_ADDR      FS_ABS(FS_OFF_META_A)   /* 元数据A 64KB  */
+#define FS_SECTOR5_ADDR      FS_ABS(FS_OFF_DATA_A)   /* 数据A  128KB */
+#define FS_SECTOR6_ADDR      FS_ABS(FS_OFF_DATA_B)   /* 数据B  128KB */
+#define FS_SECTOR7_ADDR      FS_ABS(FS_OFF_META_B)   /* 元数据B 128KB */
 
 #define FS_MAGIC             0x4A595631UL   /* "JYV1" */
 #define FS_HEAD_WORDS        64              /* 扇区头 256B */
@@ -514,10 +537,19 @@ FS_Err_t FS_Append(const FS_Record_t *rec)
     if (!s_data_ready) return FS_ERR_NOTREADY;
 
     if (s_q_count >= FS_RAM_CAP) {
-        /* 队列满：丢弃最旧未确认记录并计数（契约 §10.7） */
-        s_dropped++;
-        memmove(&s_queue[0], &s_queue[1], (s_q_count-1)*sizeof(FS_SlotIdx_t));
-        s_q_count--;
+        /* 队列满（= 容量上限，已无法保存更多历史）：丢弃最旧的一批。
+           为什么是"一批"而不是"一条"：
+             只丢 1 条时，回收后条数 = 容量-1，下一次 Append 立刻又会满，
+             于是【每写一条新记录都触发一次整扇区迁移】
+             （擦 128KB + 重写约 130KB）。按 10s 节律约 11 天就能磨穿
+             一个数据扇区的擦写寿命，而且每次迁移都会阻塞主循环约 1 秒。
+             丢 1/8 之后，可以再安稳定写入约 255 条才需要下一次迁移。 */
+        uint32_t drop = FS_RAM_CAP / 8;
+        if (drop == 0) drop = 1;
+        if (drop > s_q_count) drop = s_q_count;
+        s_dropped += drop;
+        memmove(&s_queue[0], &s_queue[drop], (s_q_count - drop) * sizeof(FS_SlotIdx_t));
+        s_q_count -= drop;
         if (FS_Recycle() != FS_OK) {
             return FS_ERR_FULL;     /* 回收失败：旧扇区仍完整，本次不写入 */
         }

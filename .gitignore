@@ -45,3 +45,7 @@ Desktop.ini
 
 # Backup directories
 backup-*/
+
+# Host test artifacts
+tests/host/last_result.txt
+tests/host/*.exe

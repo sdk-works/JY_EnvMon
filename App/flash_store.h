@@ -52,10 +52,13 @@
 #define FLASH_STORE_REC_SIZE       64
 #define FLASH_STORE_SECTOR_HDR     256
 #define FLASH_STORE_CAP_PER_SECTOR ((FLASH_STORE_DATA_SECTOR_SIZE - FLASH_STORE_SECTOR_HDR) / FLASH_STORE_REC_SIZE)
-/* (128KB-256)/64 ≈ 2046 条/扇区；保守对外约 2000 条 ≈ 33h */
+/* (128KB-256)/64 = 2044 条/扇区 */
 
-/* 采样节律（契约 §8.1） */
-#define FLASH_STORE_SAMPLE_MS      60000   /* 每60秒持久化一条新记录 */
+/* 采样节律【不在本模块定义】
+   唯一控制点是 dtu.h 的 DTU_NEW_RECORD_MS（快速验证 10s / 生产 60s）。
+   此处原先另有一份 FLASH_STORE_SAMPLE_MS=60000，与 dtu.h 的 10s 互相矛盾
+   且从未被引用，已删除，避免"两处数值谁是准"的歧义。
+   容量换算：2044 条/扇区 → 10s 约 5h40m，60s 约 34h。 */
 
 /* 数据定点倍率（契约 §10.6）
    注意：光照量用 FS_FIXED_UINT1，保持 uint32 语义，禁止走 float/int32 中转。 */
