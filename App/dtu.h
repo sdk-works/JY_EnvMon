@@ -23,23 +23,26 @@
 #define DTU_DEVICE_ID     "JY001"
 
 /* ====== 节律参数（契约 §8）—— 唯一定义处，flash_store.h 不再重复定义 ======
-   用下面这一个开关切换"快速验证"与"生产节律"，不要直接改数值：
+   默认 = 生产节律：记录 60s/条，补传发送槽 5s/条。
 
-     DTU_FAST_TEST_RHYTHM 打开（当前）：10s/条、2s 槽
-        → 缓存容量约 2044 条 ≈ 5h40m，便于在数小时内跑满并验证扇区迁移
-     DTU_FAST_TEST_RHYTHM 注释掉：60s/条、5s 槽
-        → 容量约 34h，正式部署用
+   与采集解耦（三层节拍，互不要求同频）：
+     · 传感器采集：快档 5s（app.c COLLECT_FAST_MS）、慢档 30s（COLLECT_SLOW_MS）
+     · 记录持久化：本文件 DTU_NEW_RECORD_MS = 60s（写 Flash + 唯一 msg_id）
+     · 屏幕刷新：翻页 5s；采集成功后立即刷新当前页数值（app.c）
 
-   验证内容（ACK 全等/退避/插队/断电补传）与节律无关，验证通过后
-   注释掉本宏即切回生产参数，其余代码无需改动。 */
-#define DTU_FAST_TEST_RHYTHM
+   "记录生成后立即发送"：记录周期(60s)远大于发送槽(5s)，新记录生成时发送槽
+   必然已空闲，因此无需额外等待，下一次状态机调度即发出（不等到下一个 60s）。
 
-#ifdef DTU_FAST_TEST_RHYTHM
-#define DTU_SEND_SLOT_MS      2000      /* 发送槽最小间隔 2s（生产 5000） */
-#define DTU_NEW_RECORD_MS     10000     /* 每 10s 生成一条记录（生产 60000） */
+   【主机测试】run_host_tests.js 会加 -DJY_HOST_TEST，保持 10s/2s 快速档，
+   让既有断言（推进节奏、退避 2s/4s/8s…）继续成立，且单次测试更快。
+   若要临时做上板快速验证，可在这里定义 DTU_FAST_TEST_RHYTHM。
+   正式部署：两者都不要定义（默认走生产档）。 */
+#if defined(JY_HOST_TEST) || defined(DTU_FAST_TEST_RHYTHM)
+#define DTU_SEND_SLOT_MS      2000      /* 快速验证：发送槽 2s */
+#define DTU_NEW_RECORD_MS     10000     /* 快速验证：每 10s 一条记录 */
 #else
-#define DTU_SEND_SLOT_MS      5000      /* 发送槽最小间隔 5s */
-#define DTU_NEW_RECORD_MS     60000     /* 每 60s 生成一条记录 */
+#define DTU_SEND_SLOT_MS      5000      /* 生产：发送槽（补传节奏）5s */
+#define DTU_NEW_RECORD_MS     60000     /* 生产：每 60s 生成一条记录 */
 #endif
 #define DTU_HIST_PER_NEW      3         /* 每补传3条历史，插1条最新 */
 

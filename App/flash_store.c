@@ -120,7 +120,7 @@ static FS_SlotIdx_t s_queue[FS_RAM_CAP];
 static uint32_t     s_q_count = 0;  /* 未确认记录数 */
 
 /* ====== 迁移可观测性 ====== */
-static FS_Diag_t s_migdiag = {0, 0, 0, 0, FS_PHASE_IDLE, FS_PHASE_IDLE};
+static FS_Diag_t s_migdiag;   /* 全零初始化：各阶段码 IDLE/NONE 都是 0 */
 static void (*s_progress_hook)(void) = 0;
 static void (*s_phase_hook)(uint8_t) = 0;
 
@@ -396,6 +396,11 @@ static int32_t FS_CopyPendingTo(uint32_t target_base, uint32_t new_gen,
     uint32_t target_sector = (target_base == FS_SECTOR5_ADDR) ? FLASH_STORE_SECTOR_DATA_A
                                                               : FLASH_STORE_SECTOR_DATA_B;
     FS_Phase(FS_PHASE_ERASE_TARGET);
+    /* 【擦除前先喂一次】上一处喂狗在主循环末尾，从那时到这里的路径是
+       "采集 → 刷屏 → 串口 → FS_Append 前处理"，这三项耗时没有手册上界。
+       不在擦除前补一次喂狗，最坏间隔就变成"采集+刷屏+擦除"，
+       把不可测项混进了看门狗预算。补这一次后，最长间隔恒等于擦除本身。 */
+    FS_Progress();
     if (FS_EraseSector(target_sector) != 0) return -1;
     FS_Progress();
 
@@ -548,6 +553,33 @@ static int FS_MetaAppend(uint32_t base, uint32_t cap, uint32_t boot, uint32_t ge
 
 /* ====== 公开接口 ====== */
 
+/* 上电反推"上次迁移中断在哪一阶段"（判据见 flash_store.h 的 FS_MigIntPhase_t）。
+   纯读操作，不改任何 Flash 内容；上板断电测试全靠它，不需要示波器打点。 */
+static uint8_t FS_InferInterrupted(const FS_DataHdr_t *h5, const FS_DataHdr_t *h6)
+{
+    int v5 = (h5->magic == FS_MAGIC);
+    int v6 = (h6->magic == FS_MAGIC);
+    int c5 = v5 && (h5->committed == 0u);
+    int c6 = v6 && (h6->committed == 0u);
+
+    if (c5 && c6) {
+        /* 两个扇区都已提交：正常稳态下旧扇区会被擦掉，所以只剩一个有效。
+           代次相邻说明新扇区已提交、旧扇区还没擦完（或擦除失败）。 */
+        if ((h5->generation + 1u == h6->generation) ||
+            (h6->generation + 1u == h5->generation)) {
+            return FS_MIG_INT_AFTER_COMMIT;
+        }
+        return FS_MIG_INT_NONE;
+    }
+    /* 头已写、未提交：说明死在"逐条复制"里（或复制校验失败）。
+       此时旧扇区仍完整，上电后应选旧扇区，目标扇区留待下次迁移重擦。 */
+    if (v5 && !c5) return FS_MIG_INT_COPY;
+    if (v6 && !c6) return FS_MIG_INT_COPY;
+
+    /* 一空一提交 = 正常稳态；擦目标阶段中断也长这样，且旧扇区完好、无危害。 */
+    return FS_MIG_INT_NONE;
+}
+
 FS_Err_t FS_Init(void)
 {
     s_boot_id = 0;
@@ -560,6 +592,7 @@ FS_Err_t FS_Init(void)
     s_migdiag.max_ms       = 0;
     s_migdiag.phase        = FS_PHASE_IDLE;
     s_migdiag.fail_phase   = FS_PHASE_IDLE;
+    s_migdiag.last_int_phase = FS_MIG_INT_NONE;
     s_data_ready = false;
     s_used = 0;
     s_q_count = 0;
@@ -589,6 +622,9 @@ FS_Err_t FS_Init(void)
     FS_DataHdr_t h5, h6;
     FS_ReadDataHdr(FS_SECTOR5_ADDR, &h5);
     FS_ReadDataHdr(FS_SECTOR6_ADDR, &h6);
+
+    /* 先反推上次迁移中断阶段（要在选择活动扇区、可能擦 S5 之前做，否则痕迹被擦掉） */
+    s_migdiag.last_int_phase = FS_InferInterrupted(&h5, &h6);
 
     int use5 = 0;
     if (h5.magic == FS_MAGIC && h5.committed == 0) {
@@ -728,6 +764,8 @@ uint32_t FS_NextBootId(void)
     }
     if (keep_max != s_boot_id) return 0;   /* 保留扇区未持有最新编号，拒绝擦除 */
 
+    FS_Progress();          /* 擦除前补喂：本函数在 FS_Init 内调用，此时 IWDG 尚未启动，
+                               但保留这次调用以覆盖"将来被移到运行期"的情况 */
     if (FS_EraseSector(erase_sector) != 0) return 0;
     r = FS_MetaAppend(erase_addr, erase_cap, new_boot, gen);
     if (r >= 0) { s_boot_id = new_boot; return s_boot_id; }
@@ -931,6 +969,7 @@ static FS_Err_t FS_RecycleFrom(uint32_t first)
     uint32_t old_sector = (s_act_data_addr == FS_SECTOR5_ADDR) ? FLASH_STORE_SECTOR_DATA_A
                                                                : FLASH_STORE_SECTOR_DATA_B;
     FS_Phase(FS_PHASE_ERASE_OLD);
+    FS_Progress();          /* 同上：擦除前补喂，避免把不可切分的擦除接到别处的阻塞后面 */
     (void)FS_EraseSector(old_sector);
     FS_Progress();
     /* 切活动 */

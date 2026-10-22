@@ -736,6 +736,12 @@ static void case_power_loss_in_migration(void)
 
     /* 断电重启：必须回到旧扇区，记录完整 */
     FS_Init();
+    {
+        /* 同时验证"断电阶段自证"：复制阶段中断 → 屏显 M2（D 组唯一观测手段） */
+        FS_Diag_t d;
+        FS_GetDiag(&d);
+        ck(d.last_int_phase == FS_MIG_INT_COPY, "上电应反推出上次断在复制阶段（M2）");
+    }
     ck(FS_PendingCount() == (uint32_t)CAP, "重启后记录数不变");
     ck(FS_ReadById(1, 1, &rr) && rr.seq == 1, "重启后最旧记录仍在");
     ck(FS_ReadById(1, (uint32_t)CAP, &rr) && rr.seq == (uint32_t)CAP, "重启后最新记录仍在");
@@ -788,8 +794,10 @@ static void case_migration_diag(void)
     ck(d.migrate_ok == 1 && d.migrate_fail == 0, "迁移计数应 +1、失败 0");
     ck(d.phase == FS_PHASE_IDLE, "结束后阶段应为 IDLE");
     ck(d.max_ms == d.last_ms, "max_ms 不应小于 last_ms");
-    /* 5 条：擦目标 1 次 + 擦旧 1 次 + 提交 1 次（复制不足 32 条不计） */
-    ck(s_progress_n == 3, "短迁移的进度回调应为 3 次（两擦+提交）");
+    /* 5 次：擦目标前补喂 1 + 擦目标后 1 + 擦旧前补喂 1 + 擦旧后 1 + 提交 1
+       （复制不足 32 条不计）。擦除前补喂是本轮新增的：让"采集/刷屏/串口"
+       这些无手册上界的耗时不再叠加到擦除上，见 BOARD_TEST_PLAN §4.2。 */
+    ck(s_progress_n == 5, "短迁移的进度回调应为 5 次（两擦各前后各一次 + 提交）");
 
     /* 满缓存迁移：复制 1789 条，必须按进展多次喂狗，否则 4s 看门狗会中途复位 */
     flash_sim_reset();
@@ -821,6 +829,70 @@ static void case_migration_diag(void)
     FS_SetProgressHook(0);
 }
 
+/* 19. 断电阶段自证：不接示波器/不接 GPIO，靠上电扫描 Flash 现场反推"上次断在哪个
+   阶段"。这是 D 组上板断电测试唯一的观测手段，判据必须钉死。 */
+static void case_interrupt_phase_infer(void)
+{
+    FS_Diag_t d;
+    FS_Record_t rr;
+    uint8_t hdr[16];
+    uint32_t magic = 0x4A595631u;          /* "JYV1" */
+    uint32_t committed = 0u;
+    uint32_t not_committed = 0xFFFFFFFFu;
+
+    begin("interrupt_phase_infer");
+
+    /* A：正常稳态 → NONE。擦目标阶段断电也长这样（旧扇区完好），无需区分。 */
+    flash_sim_reset();
+    Dtu_Init();
+    ck(append_seq(1, 1, 31), "前置：写 1 条");
+    FS_GetDiag(&d);
+    ck(d.last_int_phase == FS_MIG_INT_NONE, "正常稳态应报 NONE");
+
+    /* B：先成功迁移一次（活动扇区切到 S6），再人工造出
+          "S5 已提交(gen1)、S6 已提交(gen2)" 的现场 = 提交后没来得及擦旧扇区。 */
+    ck(append_seq(1, 2, 32), "前置：再写 1 条");
+    ck(FS_Recycle() == FS_OK, "前置：迁移成功");
+    {
+        uint32_t gen1 = 1u, used = 2u;
+        memcpy(hdr + 0, &magic, 4);
+        memcpy(hdr + 4, &gen1, 4);
+        memcpy(hdr + 8, &committed, 4);
+        memcpy(hdr + 12, &used, 4);
+        flash_sim_poke(SECTOR5_ADDR, hdr, 16);
+    }
+    FS_Init();
+    FS_GetDiag(&d);
+    ck(d.last_int_phase == FS_MIG_INT_AFTER_COMMIT, "两扇区都已提交且代次相邻 → M3");
+    ck(FS_PendingCount() == 2, "必须选中代次较新的扇区，记录一条不少");
+    ck(FS_ReadById(1, 2, &rr) && rr.seq == 2, "最新记录仍可读");
+
+    /* C：目标扇区头已写、committed 仍是 0xFFFFFFFF = 死在复制阶段 → M2。
+          上电必须拒绝这个未提交扇区，回到旧扇区。 */
+    {
+        uint32_t gen3 = 3u, used = 2u;
+        memcpy(hdr + 0, &magic, 4);
+        memcpy(hdr + 4, &gen3, 4);
+        memcpy(hdr + 8, &not_committed, 4);
+        memcpy(hdr + 12, &used, 4);
+        flash_sim_poke(SECTOR5_ADDR, hdr, 16);
+    }
+    FS_Init();
+    FS_GetDiag(&d);
+    ck(d.last_int_phase == FS_MIG_INT_COPY, "头已写未提交 → M2");
+    ck(FS_PendingCount() == 2, "未提交扇区不得被选中，记录不丢");
+    ck(FS_ReadById(1, 1, &rr), "最旧记录仍可读");
+
+    /* D：判定只读不改：反推过程本身不得写/擦 Flash，且随后仍能正常迁移覆盖现场 */
+    ck(flash_sim_reprogram() == 0, "反推过程不得触发二次编程");
+    ck(append_seq(1, 3, 33), "反推后应能继续写入");
+    ck(FS_Recycle() == FS_OK, "反推现场必须能被下一次迁移正常覆盖");
+    FS_Init();
+    FS_GetDiag(&d);
+    ck(d.last_int_phase == FS_MIG_INT_NONE, "干净迁移完成后应回到 NONE");
+    ck(FS_PendingCount() == 3, "三轮之后记录仍完整");
+}
+
 /* ============================================================ */
 int main(void)
 {
@@ -848,6 +920,7 @@ int main(void)
     case_full_cache_migration();
     case_power_loss_in_migration();
     case_migration_diag();
+    case_interrupt_phase_infer();
 
     fprintf(g_out, "\n===== RESULT: %d passed, %d failed =====\n", g_pass, g_fail);
     fprintf(g_out, "flash program ops = %u, erase ops = %u, reprogram violations = %u\n",

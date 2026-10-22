@@ -181,6 +181,19 @@ typedef enum {
     FS_PHASE_ERASE_OLD    = 4,   /* 擦旧扇区（已在 RAM 侧切换完成） */
 } FS_Phase_t;
 
+/* 上次上电"死在迁移的哪个阶段"——由 Flash 现场反推，不需要示波器/GPIO 打点。
+   原理：一次迁移在 Flash 里留下的痕迹是确定的，上电扫描两个数据扇区即可判定：
+     - 目标扇区整片空白、旧扇区已提交  → 正常稳态，或死在擦目标阶段（两者不可区分）
+     - 目标扇区头已写但 committed 仍为 0xFFFFFFFF → 死在复制阶段
+     - 两个扇区都已提交且代次相邻     → 死在提交之后、擦旧扇区之前/之中
+   "擦目标阶段"断电不留痕迹也无需区分：那时旧扇区完好，数据一条没少。
+   注意：迁移"校验失败返回 -1"留下的痕迹与断电完全相同，故统一叫"中断"。 */
+typedef enum {
+    FS_MIG_INT_NONE         = 0,   /* 未检测到中断（或中断发生在擦目标阶段，无痕迹无危害） */
+    FS_MIG_INT_COPY         = 2,   /* 复制记录阶段中断（目标扇区头已写、未提交） */
+    FS_MIG_INT_AFTER_COMMIT = 3,   /* 已提交、擦旧扇区之前/之中中断 */
+} FS_MigIntPhase_t;
+
 typedef struct {
     uint32_t migrate_ok;     /* 本次上电成功迁移次数 */
     uint32_t migrate_fail;   /* 本次上电迁移失败次数（失败时旧扇区保持有效） */
@@ -188,6 +201,8 @@ typedef struct {
     uint32_t max_ms;         /* 本次上电最长迁移耗时（ms） */
     uint8_t  phase;          /* 当前/最近阶段 FS_Phase_t */
     uint8_t  fail_phase;     /* 最近一次失败时所处阶段 */
+    uint8_t  last_int_phase; /* 上次断电/中断所处阶段 FS_MigIntPhase_t（扫描时确定，跨复位有效） */
+    uint8_t  _rsv;
 } FS_Diag_t;
 
 /* 复制一条记录的估算、擦除一次扇区的估算都不做假设：

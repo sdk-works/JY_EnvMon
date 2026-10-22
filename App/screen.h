@@ -14,4 +14,9 @@
  *   由 app.c 每 8 秒切换下一项。 */
 void Screen_ShowItem(uint8_t idx);
 
+/* 通用一帧文本（诊断页用）：中文名称 ≤2 字 + 数值 ≤5 字符 + 单位 ≤5 字符。
+   传入 NULL/空串则该区域留空。 */
+void Screen_ShowText(const uint8_t *name, uint16_t name_len,
+                     const char *val, const char *uni);
+
 #endif

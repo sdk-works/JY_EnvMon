@@ -60,7 +60,8 @@ for (const f of SOURCES) {
 const t = new tcc.Tcc(dll);
 // stub 必须排在 App 前面，才能覆盖 main.h / stm32f4xx_hal.h
 // FS_HOST_TEST 让 flash_store.c 的扇区地址改由变量计算（测试需把 Flash 映射进进程）
-t.setOptions(`-DFS_HOST_TEST -I"${STUB}" -I"${APP}" -I"${HOST}"`);
+// JY_HOST_TEST 让 dtu.h 保持 10s/2s 快速节拍（固件默认已是 60s/5s 生产节拍）
+t.setOptions(`-DFS_HOST_TEST -DJY_HOST_TEST -I"${STUB}" -I"${APP}" -I"${HOST}"`);
 
 for (const f of SOURCES) {
   try {

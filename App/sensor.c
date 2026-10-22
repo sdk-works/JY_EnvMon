@@ -55,10 +55,23 @@ AppErr_t Soil_Read(void)
     return APP_OK;
 }
 
-/* 采集全部传感器 */
-void Sensor_Collect(void)
+/* 快档采集：百叶箱（温湿度/CO2/光照/气压，同一寄存器块一次读回） */
+void Sensor_CollectFast(void)
 {
     if (BLE_Box_Read() != APP_OK) g_env.ble_box_valid = 0;
-    if (Soil_Read() != APP_OK)    g_env.soil_valid = 0;
     g_env.last_update_ms = HAL_GetTick();
+}
+
+/* 慢档采集：土壤三合一（温湿度/EC） */
+void Sensor_CollectSlow(void)
+{
+    if (Soil_Read() != APP_OK) g_env.soil_valid = 0;
+    g_env.last_update_ms = HAL_GetTick();
+}
+
+/* 兼容接口：两组一起采（不分层的调用方用） */
+void Sensor_Collect(void)
+{
+    Sensor_CollectFast();
+    Sensor_CollectSlow();
 }

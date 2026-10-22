@@ -422,3 +422,42 @@ void Screen_ShowItem(uint8_t idx)
         Screen_Send(frame, flen);
     }
 }
+
+/* 通用一帧：中文名称(GB2312, ≤2 字) + 数值(ASCII, ≤5) + 单位(ASCII, ≤5)。
+   供 app.c 的诊断页使用（待发/丢弃/阶段/喂狗间隔…），不改动上面 8 个指标页的布局。
+   val / uni 传 NULL 或空串表示该区域留空。 */
+void Screen_ShowText(const uint8_t *name, uint16_t name_len,
+                     const char *val, const char *uni)
+{
+    static uint8_t frame[SCREEN_WIRE_MAX];
+    Screen_Area_t areas[3];
+    const char *name_font = SCREEN_FONT_NAME_CN;
+    uint16_t vlen = 0, ulen = 0;
+
+    if (name == NULL) return;
+    if (name_len > 4) name_len = 4;                 /* 名称区 24px / 12px = 2 个汉字 */
+
+    if (val) { vlen = (uint16_t)strlen(val); if (vlen > SCREEN_VAL_MAX)  vlen = SCREEN_VAL_MAX; }
+    if (uni) { ulen = (uint16_t)strlen(uni); if (ulen > SCREEN_UNIT_MAX) ulen = SCREEN_UNIT_MAX; }
+
+    if (name_len && name[0] < 0x80) name_font = SCREEN_FONT_NAME_EN;   /* 纯 ASCII 用英文字库 */
+
+    areas[0].x = AREA_NAME_X; areas[0].y = AREA_NAME_Y;
+    areas[0].w = AREA_NAME_W; areas[0].h = AREA_NAME_H;
+    areas[0].len = name_len ? Screen_Seg(areas[0].data, name_font, name, name_len) : 0;
+
+    areas[1].x = AREA_VAL_X;  areas[1].y = AREA_VAL_Y;
+    areas[1].w = AREA_VAL_W;  areas[1].h = AREA_VAL_H;
+    areas[1].len = vlen ? Screen_Seg(areas[1].data, SCREEN_FONT_NAME_NUM,
+                                     (const uint8_t *)val, vlen) : 0;
+
+    areas[2].x = AREA_UNI_X;  areas[2].y = AREA_UNI_Y;
+    areas[2].w = AREA_UNI_W;  areas[2].h = AREA_UNI_H;
+    areas[2].len = ulen ? Screen_Seg(areas[2].data, SCREEN_FONT_NAME_EN,
+                                     (const uint8_t *)uni, ulen) : 0;
+
+    {
+        uint16_t flen = Screen_BuildFrame(areas, 3, frame);
+        Screen_Send(frame, flen);
+    }
+}
